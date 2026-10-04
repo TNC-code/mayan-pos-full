@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# environment & secrets (JANGAN commit)
+.env
+.env.*
+!.env.example
+
+# backup database
+backups/
+*.dump
+
+# log
+*.log
+logs/
+
+# runtime artifact
+tmp/
+nota_*.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
