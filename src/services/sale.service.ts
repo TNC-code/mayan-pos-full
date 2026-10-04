@@ -123,6 +123,9 @@ export interface SaleInput {
 /** Item void (UC-C): tanpa qty - void selalu mengembalikan seluruh item tersebut. */
 export interface VoidItemInput {
   sale_item_id: number;
+  /** Opsional untuk kompatibilitas lama (tanpa qty = seluruh qty baris).
+   *  Diperlukan bila satu baris dipecah per kondisi (mis. 1 GOOD + 1 RUSAK). */
+  qty?: number;
   condition?: StockCondition;
 }
 
@@ -593,10 +596,12 @@ async function insertReturnMovements(
 /**
  * Susun daftar barang yang kembali ke gudang saat void (UC-C).
  * Tanpa `items` -> seluruh item sale kembali, semua GOOD (perilaku lama, kompatibel FE).
- * Dengan `items` -> hanya item yang disebut, kondisi bisa GOOD atau RUSAK.
- * Catatan: void bersifat utuh untuk HEADER sale, jadi idealnya `items` berisi semua
- * item - item yang tidak disebut tidak gotten stok baliknya.
- * PrahASIL (state machine) tetap diperiksa di aplikasi: trigger DB hanya memvalidasi
+ * Dengan `items` -> satu baris BOLEH dipecah per kondisi (mis. 1 GOOD + 1 RUSAK dari
+ * baris 2 pcs): entri dengan `qty` eksplisit diagregasi per (sale_item_id, kondisi);
+ * entri tunggal tanpa `qty` = seluruh qty baris dengan kondisi itu (kompatibel lama).
+ * Validasi: void = pembatalan UTUH — setiap item harus disebut dan total qty per item
+ * harus sama dengan qty jual (stok tidak boleh hilang ataupun ganda).
+ * Prakondisi (state machine) tetap diperiksa di aplikasi: trigger DB hanya memvalidasi
  * saat `status` benar-benar BERUBAH, sehingga void kedua pada sale yang sudah VOIDED
  * akan lolos bila tidak dicegah di sini.
  */
@@ -611,29 +616,64 @@ function planVoidReturn(saleId: number, items: Map<number, ReturnableItem>, requ
     }));
   }
 
-  const seen = new Set<number>();
-  return requested.map((r) => {
-    if (seen.has(r.sale_item_id)) {
-      throw new ApiError(
-        'VALIDATION_ERROR',
-        `sale_item_id=${r.sale_item_id} muncul lebih dari sekali pada void yang sama`,
-      );
-    }
-    seen.add(r.sale_item_id);
-
+  // Agregasi per sale_item_id + kondisi (pola sama dengan planRefund).
+  const wanted = new Map<number, { GOOD: number; RUSAK: number; implicit: boolean }>();
+  for (const r of requested) {
     const it = items.get(r.sale_item_id);
     if (!it) {
       throw new ApiError('VOID_ITEM_MISMATCH', `sale_item_id=${r.sale_item_id} bukan item dari penjualan #${saleId}`);
     }
-    // Void = pembatalan utuh, jadi qty balik mengikuti qty jual item tersebut.
-    return {
-      product_id: it.product_id,
-      batch_id: it.batch_id,
-      qty: it.qty,
-      unit_cost: it.unit_cost,
-      condition: (r.condition ?? 'GOOD') as StockCondition,
-    };
-  });
+    const condition: StockCondition = r.condition === 'RUSAK' ? 'RUSAK' : 'GOOD';
+    const bucket = wanted.get(r.sale_item_id) ?? { GOOD: 0, RUSAK: 0, implicit: false };
+    if (typeof r.qty === 'number' && Number.isFinite(r.qty)) {
+      if (r.qty <= 0) {
+        throw new ApiError('VALIDATION_ERROR', `qty void untuk sale_item_id=${r.sale_item_id} harus lebih besar dari 0`);
+      }
+      if (bucket.implicit) {
+        throw new ApiError(
+          'VALIDATION_ERROR',
+          `campuran entri dengan dan tanpa qty untuk sale_item_id=${r.sale_item_id} tidak diizinkan`,
+        );
+      }
+      bucket[condition] += r.qty;
+    } else {
+      if (bucket.GOOD > 0 || bucket.RUSAK > 0 || bucket.implicit) {
+        throw new ApiError(
+          'VALIDATION_ERROR',
+          `entri tanpa qty untuk sale_item_id=${r.sale_item_id} hanya boleh satu (gunakan qty eksplisit untuk memecah kondisi)`,
+        );
+      }
+      bucket[condition] = it.qty;
+      bucket.implicit = true;
+    }
+    wanted.set(r.sale_item_id, bucket);
+  }
+
+  // Void = pembatalan utuh: semua item harus tercakup, Σ qty per item = qty jual.
+  const lines: ReturnLine[] = [];
+  for (const it of items.values()) {
+    const bucket = wanted.get(it.id);
+    if (!bucket) {
+      throw new ApiError(
+        'VALIDATION_ERROR',
+        `semua item harus dikembalikan saat void: sale_item_id=${it.id} belum disebut`,
+      );
+    }
+    const total = round3(bucket.GOOD + bucket.RUSAK);
+    if (Math.abs(total - it.qty) > 0.0005) {
+      throw new ApiError(
+        'VALIDATION_ERROR',
+        `total qty void untuk sale_item_id=${it.id} (${total}) harus sama dengan qty jual (${it.qty})`,
+      );
+    }
+    for (const condition of <StockCondition[]>['GOOD', 'RUSAK']) {
+      const qty = round3(bucket[condition]);
+      if (qty > 0) {
+        lines.push({ product_id: it.product_id, batch_id: it.batch_id, qty, unit_cost: it.unit_cost, condition });
+      }
+    }
+  }
+  return lines;
 }
 
 /** POST /sales/{id}/void - hanya untuk penjualan yang belum dibayar. */

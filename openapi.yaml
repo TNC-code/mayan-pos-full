@@ -1614,7 +1614,12 @@ components:
               sale_item_id: { type: integer }
               qty:
                 type: number
-                description: 'hanya refund; qty dikembalikan (<= sisa qty jual). Void mengabaikannya (void selalu utuh)'
+                description: >-
+                  qty dengan kondisi ini. Void: entri tunggal tanpa qty = seluruh
+                  qty baris; untuk MEMECAH satu baris per kondisi (mis. 1 GOOD + 1
+                  RUSAK dari baris 2 pcs) kirim dua entri dengan qty eksplisit —
+                  total per item harus = qty jual (void = pembatalan utuh).
+                  Refund: qty yang dikembalikan (<= sisa qty jual).
               condition:
                 type: string
                 enum: [GOOD, RUSAK]
