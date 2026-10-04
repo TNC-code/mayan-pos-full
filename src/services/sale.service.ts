@@ -16,6 +16,7 @@ export interface SaleRow {
   sale_no: string;
   customer_id: number | null;
   customer_name: string | null;
+  customer_address: string | null;
   total_amount: number;
   tax_amount: number;
   status: string;
@@ -141,7 +142,8 @@ export interface RefundInput {
 /* ============================ selectors ============================ */
 
 const SELECT_SALE = `
-  SELECT s.id, s.sale_no, s.customer_id, c.name AS customer_name, s.total_amount, s.tax_amount, s.status,
+  SELECT s.id, s.sale_no, s.customer_id, c.name AS customer_name, c.address AS customer_address,
+         s.total_amount, s.tax_amount, s.status,
          s.payment_status, s.sale_date, s.note, s.created_by, u.username AS created_by_name,
          s.voided_at, s.voided_by, s.void_reason, s.is_test
     FROM sales s

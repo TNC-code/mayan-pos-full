@@ -80,6 +80,7 @@ export interface Receipt {
     payment_status: string;
     cashier: string | null;
     customer: string | null;
+    customer_address: string | null;
     note: string | null;
   };
   items: Array<{
@@ -134,6 +135,7 @@ export async function saleReceipt(saleId: number): Promise<Receipt> {
       payment_status: sale.payment_status,
       cashier: sale.created_by_name,
       customer: sale.customer_name,
+      customer_address: sale.customer_address,
       note: sale.note,
     },
     items: sale.items.map((it) => ({

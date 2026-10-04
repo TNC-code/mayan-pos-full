@@ -210,6 +210,7 @@ Layout thermal (58mm ≈ 32 kolon / 80mm ≈ 48 kolon), CSS `@media print`:
 │ INV-20261004-139            │  <- sale.sale_no
 │ 2026-10-04 06:17  Kasir:owner│
 │ Customer: Bpk. Andi         │
+│ Jl. Kenanga No. 5, Kota X   │  <- sale.customer_address (jika ada)
 │─────────────────────────────│
 │ kartu perdana 20GB Tri      │
 │  11 pcs x 24.500   269.500  │

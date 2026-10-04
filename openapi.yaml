@@ -1222,6 +1222,7 @@ components:
             payment_status: { type: string }
             cashier: { type: string, nullable: true }
             customer: { type: string, nullable: true }
+            customer_address: { type: string, nullable: true, description: Alamat customer (untuk nota kirim/delivery) }
             note: { type: string, nullable: true }
         items:
           type: array
