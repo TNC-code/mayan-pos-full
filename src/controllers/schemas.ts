@@ -141,13 +141,25 @@ const salePaymentSchema = z.object({
   notes: z.string().trim().max(500).nullish(),
 });
 
-export const saleCreateSchema = z.object({
-  customer_id: id.nullish(),
-  note: z.string().trim().max(500).nullish(),
-  items: z.array(saleItemSchema).min(1, 'minimal 1 item penjualan'),
-  payment: salePaymentSchema.nullish(),
-  tax_percent: z.coerce.number().min(0).max(100).nullish(),
-});
+export const saleCreateSchema = z
+  .object({
+    customer_id: id.nullish(),
+    note: z.string().trim().max(500).nullish(),
+    items: z.array(saleItemSchema).min(1, 'minimal 1 item penjualan'),
+    payment: salePaymentSchema.nullish(),
+    tax_percent: z.coerce.number().min(0).max(100).nullish(),
+  })
+  .superRefine((val, ctx) => {
+    // Kasbon (tanpa pembayaran awal) wajib atas nama customer — piutang tanpa
+    // nama tidak bisa ditagih dan tidak muncul rapi di layar Piutang.
+    if (val.payment == null && val.customer_id == null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['customer_id'],
+        message: 'Penjualan tanpa pembayaran awal (kasbon) wajib menyertakan customer_id',
+      });
+    }
+  });
 
 export const saleListSchema = z.object({
   date_from: dateStr.optional(),

@@ -99,6 +99,12 @@ CODE=$(post "$API/payment-methods" '{"code":"OTHER","name":"TEST Other"}'); chec
 TOKEN=$SAVED
 CODE=$(get "$API/payment-methods"); check "b11 kasir boleh list method 200" 200 "$CODE"
 
+step "b) customer uji (wajib untuk sale kasbon/UNPAID)"
+CODE=$(post "$API/customers" "{\"name\":\"TEST Customer $RUN_TAG\",\"phone\":\"08120000$RUN_TAG\",\"owner_name\":\"TEST pemilik\"}")
+check "b12a create customer 201" 201 "$CODE" "$(body)"
+CUST_ID=$(jqv id < /tmp/r.json)
+[[ -n "$CUST_ID" ]] && ok "b12b customer id ada" "$CUST_ID" || bad "b12b customer id ada" "kosong"
+
 hr "FASE 2 - pembelian (barang masuk)"
 step "b) purchase 10 kg gula @10000"
 CODE=$(post "$API/purchases" "{\"product_id\":$GULA_ID,\"qty\":10,\"unit_cost\":10000,\"supplier\":\"TEST supplier\",\"notes\":\"uji e2e\"}")
@@ -140,7 +146,7 @@ check "c13 qty_change -0.25" "-0.25" "$(jqv 0.qty_change < /tmp/r.json)"
 
 step "d) jual 2 pcs voucher @50000 dari batch eksplisit, TANPA payment"
 KEY_D=$(node -e "console.log(require('crypto').randomUUID())")
-CODE=$(post "$API/sales" "{\"items\":[{\"product_id\":$VOUCHER_ID,\"batch_id\":$VOUCHER_BATCH,\"qty\":2,\"unit_price\":50000}]}" "$KEY_D")
+CODE=$(post "$API/sales" "{\"customer_id\":$CUST_ID,\"items\":[{\"product_id\":$VOUCHER_ID,\"batch_id\":$VOUCHER_BATCH,\"qty\":2,\"unit_price\":50000}]}" "$KEY_D")
 check "d1 create sale tanpa payment 201" 201 "$CODE" "$(body)"
 SALE_D=$(jqv id < /tmp/r.json)
 check "d2 payment_status UNPAID" "UNPAID" "$(jqv payment_status < /tmp/r.json)"
@@ -185,13 +191,13 @@ CODE=$(post "$API/sales" "$PAYLOAD" "bukan-uuid"); check "e8 key bukan uuid -> 4
 hr "FASE 3/4 - peta error DB -> HTTP"
 step "f) harga jual 35000 di bawah harga beli 40000 -> 422"
 KEY_F1=$(node -e "console.log(require('crypto').randomUUID())")
-CODE=$(post "$API/sales" "{\"items\":[{\"product_id\":$VOUCHER_ID,\"qty\":1,\"unit_price\":35000}]}" "$KEY_F1")
+CODE=$(post "$API/sales" "{\"customer_id\":$CUST_ID,\"items\":[{\"product_id\":$VOUCHER_ID,\"qty\":1,\"unit_price\":35000}]}" "$KEY_F1")
 check "f1 harga < beli -> 422" 422 "$CODE" "$(body)"
 contains "f2 code PRICE_BELOW_COST" "PRICE_BELOW_COST" "$(jqv code < /tmp/r.json)"
 
 step "f) qty 999 (stok hanya 2 tersisa) -> 409"
 KEY_F2=$(node -e "console.log(require('crypto').randomUUID())")
-CODE=$(post "$API/sales" "{\"items\":[{\"product_id\":$VOUCHER_ID,\"qty\":999,\"unit_price\":50000}]}" "$KEY_F2")
+CODE=$(post "$API/sales" "{\"customer_id\":$CUST_ID,\"items\":[{\"product_id\":$VOUCHER_ID,\"qty\":999,\"unit_price\":50000}]}" "$KEY_F2")
 check "f3 stok tidak cukup -> 409" 409 "$CODE" "$(body)"
 contains "f4 code INSUFFICIENT_STOCK" "INSUFFICIENT_STOCK" "$(jqv code < /tmp/r.json)"
 
@@ -228,7 +234,7 @@ CODE=$(post "$API/sales/$SALE_C/void" '{"reason":"bayar dulu"}'); check "v1 void
 contains "v2 code VOID_NOT_ALLOWED" "VOID_NOT_ALLOWED" "$(jqv code < /tmp/r.json)"
 step "void sale UNPAID -> stok kembali"
 KEY_V=$(node -e "console.log(require('crypto').randomUUID())")
-CODE=$(post "$API/sales" "{\"items\":[{\"product_id\":$GULA_ID,\"qty\":1,\"unit_price\":15000}]}" "$KEY_V")
+CODE=$(post "$API/sales" "{\"customer_id\":$CUST_ID,\"items\":[{\"product_id\":$GULA_ID,\"qty\":1,\"unit_price\":15000}]}" "$KEY_V")
 check "v3 buat sale UNPAID 201" 201 "$CODE" "$(body)"
 SALE_V=$(jqv id < /tmp/r.json)
 CODE=$(get "$API/stock?product_id=$GULA_ID"); check "v4 stok 8.75" "8.75" "$(jqv 0.qty_on_hand < /tmp/r.json)"
@@ -267,6 +273,12 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "${API%/api/v1}/api-docs/"); check
 step "validasi body (tidak menyentuh data asli)"
 CODE=$(post "$API/sales" '{"items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")")
 check "x10 items kosong -> 400" 400 "$CODE" "$(body)"
+step "kasbon tanpa customer -> 400 (piutang wajib atas nama)"
+KEY_X12=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales" "{\"items\":[{\"product_id\":$GULA_ID,\"qty\":0.1,\"unit_price\":15000}]}" "$KEY_X12")
+check "x12 kasbon tanpa customer_id -> 400" 400 "$CODE" "$(body)"
+contains "x13 code VALIDATION_ERROR" "VALIDATION_ERROR" "$(jqv code < /tmp/r.json)"
+contains "x14 pesan menyebut customer_id" "customer_id" "$(jqv details.0.message < /tmp/r.json)"
 CODE=$(post "$API/purchases" "{\"product_id\":1,\"qty\":-5,\"unit_cost\":1}")
 check "x11 qty negatif -> 400" 400 "$CODE" "$(body)"
 
@@ -323,7 +335,7 @@ check "A20 qty_damaged tetap 1" "1" "$(jqv 0.qty_damaged < /tmp/r.json)"
 hr "UC-C - void dengan condition campuran"
 step "C) jual 2 gula + 1 voucher TANPA payment (UNPAID)"
 KEY_C2=$(node -e "console.log(require('crypto').randomUUID())")
-CODE=$(post "$API/sales" "{\"note\":\"UC-C\",\"items\":[{\"product_id\":$GULA_ID,\"qty\":2,\"unit_price\":15000},{\"product_id\":$VOUCHER_ID,\"qty\":1,\"unit_price\":50000}]}" "$KEY_C2")
+CODE=$(post "$API/sales" "{\"note\":\"UC-C\",\"customer_id\":$CUST_ID,\"items\":[{\"product_id\":$GULA_ID,\"qty\":2,\"unit_price\":15000},{\"product_id\":$VOUCHER_ID,\"qty\":1,\"unit_price\":50000}]}" "$KEY_C2")
 check "C1 create sale UNPAID 201" 201 "$CODE" "$(body)"
 SALE_C2=$(jqv id < /tmp/r.json)
 IT_C1=$(jqv items.0.id < /tmp/r.json); IT_C2=$(jqv items.1.id < /tmp/r.json)

@@ -17,8 +17,9 @@ info:
     punya flag `is_test`; semua laporan production-only mengecualikannya secara default dan
     membuka lewat `?include_test=true` (`GET /sales`, `GET /expenses`, `GET /reports/pnl`).
   x-rbac: |
-    KASIR: semua POST/PATCH/DELETE. OWNER: semua GET kecuali tidak ada (OWNER juga
-    boleh baca semua GET), namun OWNER tidak boleh melakukan mutasi apa pun.
+    KASIR = operator: semua POST/PATCH/DELETE (mutasi), termasuk POST /expenses.
+    OWNER = monitor: semua GET, namun TIDAK boleh mutasi apa pun (403).
+    Pengecualian GET: /expenses* dan seluruh /reports/* hanya OWNER (KASIR 403).
 servers:
   - url: http://localhost:3000/api/v1
     description: Local
@@ -493,6 +494,11 @@ paths:
         Satu request = 1 DB transaction (sales + items + payment awal optional).
         Gunakan header Idempotency-Key (UUID per submit) agar retry tidak dobel transaksi.
         Response 409 jika stok tidak cukup; 422 jika harga jual < harga beli.
+
+        **Aturan kasbon**: checkout TANPA `payment` (= nota UNPAID, bayar saat/after
+        pengiriman) **wajib menyertakan `customer_id`** — piutang harus atas nama.
+        Pelanggaran -> 400 VALIDATION_ERROR. Bayar langsung (payment ada) boleh
+        tanpa customer (walk-in).
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
       requestBody:
@@ -506,6 +512,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Sale' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
 
@@ -706,7 +713,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Dashboard' }
-        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+        '403': { description: "KASIR tidak diizinkan (RBAC v2 - laporan khusus OWNER)" }
 
   /alerts:
     get:
@@ -919,7 +926,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Expense' }
-        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+        '403': { description: "KASIR tidak diizinkan (RBAC v2 - laporan khusus OWNER)" }
     post:
       tags: [Expenses]
       summary: Catat pengeluaran operasional — gaji/listrik/internet (KASIR only)
@@ -949,7 +956,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Expense' }
-        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+        '403': { description: "KASIR tidak diizinkan (RBAC v2 - laporan khusus OWNER)" }
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Expenses]
@@ -994,7 +1001,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PnlReport' }
-        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+        '403': { description: "KASIR tidak diizinkan (RBAC v2 - laporan khusus OWNER)" }
 
   /reports/opname:
     get:
@@ -1015,7 +1022,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OpnameReport' }
-        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+        '403': { description: "KASIR tidak diizinkan (RBAC v2 - laporan khusus OWNER)" }
 
   /supplier-returns:
     get:
@@ -1496,7 +1503,10 @@ components:
       type: object
       required: [items]
       properties:
-        customer_id: { type: integer, nullable: true }
+        customer_id:
+          type: integer
+          nullable: true
+          description: 'WAJIB bila tanpa `payment` (kasbon/UNPAID) — piutang harus atas nama; opsional untuk bayar langsung (walk-in)'
         note: { type: string }
         tax_percent:
           type: number
