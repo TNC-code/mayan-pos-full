@@ -2,11 +2,14 @@ import type { PoolClient } from 'pg';
 import { pool } from '../config/db.js';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/errors.js';
-import { round2, withTx } from '../utils/tx.js';
+import { round2, round3, withTx } from '../utils/tx.js';
 import { nextDocNo } from './docno.js';
 import { runIdempotent } from './idempotency.service.js';
 
 /* ============================== types ============================== */
+
+/** Kondisi barang saat kembali ke gudang: GOOD (bisa dijual lagi) / RUSAK (karantina). */
+export type StockCondition = 'GOOD' | 'RUSAK';
 
 export interface SaleRow {
   id: number;
@@ -73,10 +76,22 @@ export interface RefundRow {
   refunded_by_name: string | null;
 }
 
+/** Detail refund per item (v2: refund bisa parsial + berlabel GOOD/RUSAK). */
+export interface RefundItemRow {
+  id: number;
+  refund_id: number;
+  sale_item_id: number;
+  qty: number;
+  condition: StockCondition;
+  unit_price: number;
+  subtotal: number;
+}
+
 export interface SaleDetail extends SaleRow {
   items: SaleItemRow[];
   payments: PaymentRow[];
   refunds: RefundRow[];
+  refund_items: RefundItemRow[];
 }
 
 export interface SaleInputItem {
@@ -104,6 +119,25 @@ export interface SaleInput {
   tax_percent?: number | null;
 }
 
+/** Item void (UC-C): tanpa qty - void selalu mengembalikan seluruh item tersebut. */
+export interface VoidItemInput {
+  sale_item_id: number;
+  condition?: StockCondition;
+}
+
+/** Item refund (UC-A): qty boleh sebagian dari qty jual. */
+export interface RefundItemInput extends VoidItemInput {
+  qty: number;
+}
+
+export interface RefundInput {
+  reason: string;
+  /** Boleh override; default = metode pembayaran terakhir. */
+  method_id?: number | null;
+  /** Tanpa items = refund penuh semua item sisa, semua GOOD. */
+  items?: RefundItemInput[];
+}
+
 /* ============================ selectors ============================ */
 
 const SELECT_SALE = `
@@ -121,6 +155,11 @@ const SELECT_REFUND = `
     FROM refunds r
     LEFT JOIN payment_methods m ON m.id = r.method_id
     LEFT JOIN user_account u ON u.id = r.refunded_by
+`;
+
+const SELECT_REFUND_ITEM = `
+  SELECT ri.id, ri.refund_id, ri.sale_item_id, ri.qty, ri.condition, ri.unit_price, ri.subtotal
+    FROM refund_items ri
 `;
 
 const SELECT_PAYMENT = `
@@ -208,12 +247,16 @@ async function fetchDetail(client: PoolClient | null, id: number): Promise<SaleD
     throw new ApiError('NOT_FOUND', `Penjualan id=${id} tidak ditemukan`);
   }
 
-  const [items, payments, paid, refundedSum, refundRows] = await Promise.all([
+  const [items, payments, paid, refundedSum, refundRows, refundItemRows] = await Promise.all([
     runner(`${SELECT_ITEM} WHERE si.sale_id = $1 ORDER BY si.id ASC`, [id]),
     runner(`${SELECT_PAYMENT} WHERE p.sale_id = $1 ORDER BY p.id ASC`, [id]),
     runner(`SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS paid FROM payments WHERE sale_id = $1`, [id]),
     runner(`SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS refunded FROM refunds WHERE sale_id = $1`, [id]),
     runner(`${SELECT_REFUND} WHERE r.sale_id = $1 ORDER BY r.id ASC`, [id]),
+    runner(
+      `${SELECT_REFUND_ITEM} WHERE ri.refund_id IN (SELECT id FROM refunds WHERE sale_id = $1) ORDER BY ri.id ASC`,
+      [id],
+    ),
   ]);
 
   const paidAmount = Number(paid.rows[0]?.paid ?? 0);
@@ -225,6 +268,7 @@ async function fetchDetail(client: PoolClient | null, id: number): Promise<SaleD
     items: items.rows as SaleItemRow[],
     payments: payments.rows as PaymentRow[],
     refunds: refundRows.rows as RefundRow[],
+    refund_items: refundItemRows.rows as RefundItemRow[],
     paid_amount: paidAmount,
     refunded_amount: refundedAmount,
     due_amount: dueAmount < 0 ? 0 : dueAmount,
@@ -454,27 +498,152 @@ export async function listPayments(saleId: number): Promise<PaymentRow[]> {
   return res.rows;
 }
 
-/* ====================== POST /sales/{id}/void (FASE 5) ====================== */
+/* ============ void / retur: stok balik per item + kondisi (FASE 5) ============ */
 
 /**
- * Void = UPDATE sales.status -> 'VOIDED'.
- * Trigger fn_sales_void memvalidasi voided_by / void_reason / payment_status dan
- * trigger fn_sales_void_apply mengembalikan stok lewat movement IN.
- * Tidak ada endpoint DELETE untuk sale/item - ledger immutable.
- *
+ * Sejak 0005 trigger fn_sales_void_apply TIDAK lagi membuat movement IN otomatis.
+ * Stok balik (void/retur/refund) sekarang ditulis di service ini sebagai SATU PENULIS,
+ * per item dan BERKONDISI:
+ *   GOOD -> movement IN -> trigger menambah qty_remaining (barang bisa dijual lagi)
+ *   RUSAK -> movement IN -> trigger menambah qty_damaged (karantina, tidak ikut terjual)
+ * Dengan begitu barang rusak punya jejak ledger tersendiri dan tidak terhitung dua kali.
+ * fn_sales_void (validasi transisi status) tetap penjaga di DB. Tidak ada endpoint
+ * DELETE untuk sale/item - ledger immutable.
+ */
+
+/** sale_items + sisa qty yang belum direfund (dasar validasi refund parsial). */
+interface ReturnableItem {
+  id: number;
+  product_id: number;
+  batch_id: number;
+  qty: number;
+  unit_price: number;
+  unit_cost: number;
+  refunded_qty: number;
+}
+
+/** Satu baris movement IN untuk pengembalian barang. */
+interface ReturnLine {
+  product_id: number;
+  batch_id: number;
+  qty: number;
+  unit_cost: number;
+  condition: StockCondition;
+}
+
+/** Baris refund parsial: ReturnLine + data uang (harga jual di snapshot sale_items). */
+interface RefundLine extends ReturnLine {
+  sale_item_id: number;
+  unit_price: number;
+  subtotal: number;
+}
+
+async function loadReturnableItems(client: PoolClient, saleId: number): Promise<Map<number, ReturnableItem>> {
+  const res = await client.query<ReturnableItem>(
+    `SELECT si.id, si.product_id, si.batch_id, si.qty, si.unit_price, si.unit_cost,
+            COALESCE((SELECT sum(ri.qty) FROM refund_items ri WHERE ri.sale_item_id = si.id), 0)::numeric(14,3) AS refunded_qty
+       FROM sale_items si
+      WHERE si.sale_id = $1
+      ORDER BY si.id`,
+    [saleId],
+  );
+  return new Map(res.rows.map((r) => [Number(r.id), r]));
+}
+
+/**
+ * Tulis movement IN untuk barang yang kembali ke gudang. Konvensi kolom mengikuti
+ * trigger lama (fn_sales_void_apply): reference_type VOID/RETURN, reference_id = sale,
+ * unit_cost = snapshot unit_cost sale_items, created_by = kasir yang membatalkan.
+ * `condition` adalah kolom ledger baru (migration 0005) yang menentukan kolom mana
+ * di stock_batches yang berubah (qty_remaining atau qty_damaged).
+ */
+async function insertReturnMovements(
+  client: PoolClient,
+  opts: {
+    saleId: number;
+    lines: ReturnLine[];
+    referenceType: 'VOID' | 'RETURN';
+    noteGood: string;
+    noteDamaged: string;
+    userId: number;
+  },
+): Promise<void> {
+  for (const line of opts.lines) {
+    await client.query(
+      `INSERT INTO stock_movements
+         (product_id, batch_id, movement_type, qty_change, unit_cost, reference_type, reference_id, note, created_by, condition)
+       VALUES ($1, $2, 'IN', $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        line.product_id,
+        line.batch_id,
+        line.qty,
+        line.unit_cost,
+        opts.referenceType,
+        opts.saleId,
+        line.condition === 'RUSAK' ? opts.noteDamaged : opts.noteGood,
+        opts.userId,
+        line.condition,
+      ],
+    );
+  }
+}
+
+/**
+ * Susun daftar barang yang kembali ke gudang saat void (UC-C).
+ * Tanpa `items` -> seluruh item sale kembali, semua GOOD (perilaku lama, kompatibel FE).
+ * Dengan `items` -> hanya item yang disebut, kondisi bisa GOOD atau RUSAK.
+ * Catatan: void bersifat utuh untuk HEADER sale, jadi idealnya `items` berisi semua
+ * item - item yang tidak disebut tidak gotten stok baliknya.
  * PrahASIL (state machine) tetap diperiksa di aplikasi: trigger DB hanya memvalidasi
  * saat `status` benar-benar BERUBAH, sehingga void kedua pada sale yang sudah VOIDED
  * akan lolos bila tidak dicegah di sini.
  */
-async function transitionSaleStatus(
+function planVoidReturn(saleId: number, items: Map<number, ReturnableItem>, requested: VoidItemInput[] | null): ReturnLine[] {
+  if (!requested || requested.length === 0) {
+    return [...items.values()].map((it) => ({
+      product_id: it.product_id,
+      batch_id: it.batch_id,
+      qty: it.qty,
+      unit_cost: it.unit_cost,
+      condition: 'GOOD' as StockCondition,
+    }));
+  }
+
+  const seen = new Set<number>();
+  return requested.map((r) => {
+    if (seen.has(r.sale_item_id)) {
+      throw new ApiError(
+        'VALIDATION_ERROR',
+        `sale_item_id=${r.sale_item_id} muncul lebih dari sekali pada void yang sama`,
+      );
+    }
+    seen.add(r.sale_item_id);
+
+    const it = items.get(r.sale_item_id);
+    if (!it) {
+      throw new ApiError('VOID_ITEM_MISMATCH', `sale_item_id=${r.sale_item_id} bukan item dari penjualan #${saleId}`);
+    }
+    // Void = pembatalan utuh, jadi qty balik mengikuti qty jual item tersebut.
+    return {
+      product_id: it.product_id,
+      batch_id: it.batch_id,
+      qty: it.qty,
+      unit_cost: it.unit_cost,
+      condition: (r.condition ?? 'GOOD') as StockCondition,
+    };
+  });
+}
+
+/** POST /sales/{id}/void - hanya untuk penjualan yang belum dibayar. */
+export async function voidSale(
   saleId: number,
-  target: 'VOIDED' | 'RETURNED',
   reason: string,
   userId: number,
+  requested?: VoidItemInput[] | null,
 ): Promise<SaleDetail> {
   return withTx(async (client) => {
-    const current = await client.query<{ status: string; payment_status: string; total_amount: number }>(
-      `SELECT status, payment_status, total_amount FROM sales WHERE id = $1 FOR UPDATE`,
+    const current = await client.query<{ status: string; payment_status: string }>(
+      `SELECT status, payment_status FROM sales WHERE id = $1 FOR UPDATE`,
       [saleId],
     );
     if (!current.rows[0]) {
@@ -483,42 +652,141 @@ async function transitionSaleStatus(
 
     const { status, payment_status } = current.rows[0];
     if (status !== 'COMPLETED') {
-      throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${status}, tidak bisa ${target === 'VOIDED' ? 'di-void' : 'diretur'} lagi`);
+      throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${status}, tidak bisa di-void lagi`);
     }
     // VOIDED hanya untuk yang belum dibayar; yang sudah dibayar wajib lewat refund.
-    if (target === 'VOIDED' && payment_status !== 'UNPAID') {
+    if (payment_status !== 'UNPAID') {
       throw new ApiError('VOID_NOT_ALLOWED', 'Tidak dapat void penjualan yang sudah dibayar; gunakan retur/refund');
     }
 
-    await client.query(`UPDATE sales SET status = $2, voided_by = $3, void_reason = $4 WHERE id = $1`, [
+    const items = await loadReturnableItems(client, saleId);
+    const lines = planVoidReturn(saleId, items, requested ?? null);
+
+    await client.query(`UPDATE sales SET status = 'VOIDED', voided_by = $2, void_reason = $3 WHERE id = $1`, [
       saleId,
-      target,
       userId,
       reason,
     ]);
 
+    await insertReturnMovements(client, {
+      saleId,
+      lines,
+      referenceType: 'VOID',
+      noteGood: 'Void penjualan',
+      noteDamaged: 'Void penjualan - rusak',
+      userId,
+    });
+
     return fetchDetail(client, saleId);
-  }, target === 'VOIDED' ? 'void' : 'return');
+  }, 'void');
 }
 
-export async function voidSale(saleId: number, reason: string, userId: number): Promise<SaleDetail> {
-  return transitionSaleStatus(saleId, 'VOIDED', reason, userId);
-}
-
-/* ====================== refund / retur (P1) ====================== */
+/* ====================== refund / retur (P1 + parsial) ====================== */
 
 /**
- * Retur + refund penjualan yang sudah dibayar:
- *  1. Kunci sale (harus COMPLETED).
- *  2. Hitung total sudah dibayar -> catat 1 baris `refunds` (metode = pembayaran terakhir).
- *  3. UPDATE status -> 'RETURNED' (trigger fn_sales_void DIIZINKAN walau sudah dibayar;
- *     fn_sales_void_apply mengembalikan stok lewat movement IN).
- * Belum dibayar sama sekali -> cukup retur tanpa baris refund.
+ * Susun rencana refund parsial (UC-A).
+ *  - tanpa `items` -> seluruh sisa item, semua GOOD (perilaku lama, kompatibel FE)
+ *  - dengan `items` -> qty sebagian, kondisi GOOD/RUSAK per item (bisa campur)
+ * Mengembalikan juga `full` = true bila semua item jadi habis direfund (sale -> RETURNED).
+ */
+function planRefund(
+  saleId: number,
+  items: Map<number, ReturnableItem>,
+  requested: RefundItemInput[] | null | undefined,
+): { lines: RefundLine[]; total: number; full: boolean } {
+  // Gabungkan input per sale_item_id + kondisi: 1 item boleh direfund sebagian
+  // GOOD dan sebagian RUSAK sekaligus.
+  const wanted = new Map<number, Record<StockCondition, number>>();
+
+  if (requested && requested.length > 0) {
+    for (const r of requested) {
+      const it = items.get(r.sale_item_id);
+      if (!it) {
+        throw new ApiError('VOID_ITEM_MISMATCH', `sale_item_id=${r.sale_item_id} bukan item dari penjualan #${saleId}`);
+      }
+      if (typeof r.qty !== 'number' || !Number.isFinite(r.qty)) {
+        throw new ApiError('VALIDATION_ERROR', `qty refund untuk sale_item_id=${r.sale_item_id} wajib diisi`);
+      }
+      if (r.qty <= 0) {
+        throw new ApiError(
+          'VALIDATION_ERROR',
+          `qty refund untuk sale_item_id=${r.sale_item_id} harus lebih besar dari 0`,
+        );
+      }
+      const condition: StockCondition = r.condition === 'RUSAK' ? 'RUSAK' : 'GOOD';
+      const bucket = wanted.get(r.sale_item_id) ?? { GOOD: 0, RUSAK: 0 };
+      bucket[condition] += r.qty;
+      wanted.set(r.sale_item_id, bucket);
+    }
+  } else {
+    // Refund penuh: semua sisa item, semua GOOD.
+    for (const it of items.values()) {
+      const remaining = round3(it.qty - it.refunded_qty);
+      if (remaining > 0) {
+        wanted.set(it.id, { GOOD: remaining, RUSAK: 0 });
+      }
+    }
+  }
+
+  const lines: RefundLine[] = [];
+  const askedQty = new Map<number, number>();
+
+  for (const [saleItemId, bucket] of wanted) {
+    const it = items.get(saleItemId)!;
+    const totalQty = round3(bucket.GOOD + bucket.RUSAK);
+    if (totalQty <= 0) continue;
+
+    const remaining = round3(it.qty - it.refunded_qty);
+    if (totalQty > remaining) {
+      throw new ApiError(
+        'REFUND_QTY_EXCEEDED',
+        `Qty refund melebihi sisa item: sale_item_id=${saleItemId}, terjual ${it.qty}, ` +
+          `sudah direfund ${it.refunded_qty}, diminta ${totalQty}`,
+      );
+    }
+    askedQty.set(saleItemId, totalQty);
+
+    for (const condition of ['GOOD', 'RUSAK'] as const) {
+      const qty = round3(bucket[condition]);
+      if (qty <= 0) continue;
+      lines.push({
+        sale_item_id: saleItemId,
+        product_id: it.product_id,
+        batch_id: it.batch_id,
+        qty,
+        unit_cost: it.unit_cost,
+        condition,
+        unit_price: it.unit_price,
+        subtotal: round2(qty * it.unit_price),
+      });
+    }
+  }
+
+  if (lines.length === 0) {
+    throw new ApiError('VALIDATION_ERROR', `Tidak ada item yang bisa direfund pada penjualan #${saleId}`);
+  }
+
+  const total = round2(lines.reduce((sum, l) => sum + l.subtotal, 0));
+  // Semua item habis direfund -> penjualan ditutup sebagai RETURNED.
+  const full = [...items.values()].every(
+    (it) => round3(it.refunded_qty + (askedQty.get(it.id) ?? 0)) >= round3(it.qty),
+  );
+
+  return { lines, total, full };
+}
+
+/**
+ * Retur + refund penjualan yang sudah dibayar (UC-A, refund parsial + barang rusak):
+ *  1. Kunci sale (harus COMPLETED dan sudah ada pembayarannya; UNPAID -> pakai void).
+ *  2. Susun rencana per item dari `refund_items` (sisa qty) - tanpa items = refund penuh.
+ *  3. Validasi qty per item dan total uang (<= paid - refunded).
+ *  4. Catat 1 baris `refunds` + `refund_items` + movement IN per item bercondition.
+ *  5. Status: parsial tetap COMPLETED; semua item habis -> 'RETURNED' (trigger validasi).
  * Di bungkus Idempotency-Key agar retry tidak dobel refund.
  */
 export async function refundSale(
   saleId: number,
-  reason: string,
+  input: RefundInput,
   userId: number,
   idempotencyKey: string,
 ): Promise<{ sale: SaleDetail; replayed: boolean }> {
@@ -531,28 +799,75 @@ export async function refundSale(
     if (current.rows[0].status !== 'COMPLETED') {
       throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${current.rows[0].status}, tidak bisa diretur lagi`);
     }
+    if (current.rows[0].payment_status === 'UNPAID') {
+      throw new ApiError('REFUND_NOT_ALLOWED', 'Penjualan belum dibayar; gunakan void untuk membatalkan penjualan');
+    }
 
-    const paid = await client.query<{ total: number; method_id: number | null }>(
-      `SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS total,
+    const items = await loadReturnableItems(client, saleId);
+    const plan = planRefund(saleId, items, input.items);
+
+    const money = await client.query<{ paid: number; refunded: number; method_id: number | null }>(
+      `SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS paid,
+              (SELECT COALESCE(sum(amount), 0)::numeric(14,2) FROM refunds WHERE sale_id = $1) AS refunded,
               (SELECT method_id FROM payments WHERE sale_id = $1 ORDER BY id DESC LIMIT 1) AS method_id
          FROM payments WHERE sale_id = $1`,
       [saleId],
     );
-    const paidAmount = Number(paid.rows[0]?.total ?? 0);
+    const paidAmount = Number(money.rows[0]?.paid ?? 0);
+    const refundedAmount = Number(money.rows[0]?.refunded ?? 0);
+    const refundable = round2(paidAmount - refundedAmount);
 
-    if (paidAmount > 0) {
+    if (plan.total > refundable) {
+      throw new ApiError(
+        'REFUND_AMOUNT_EXCEEDED',
+        `Total refund ${plan.total} melebihi sisa uang yang bisa dikembalikan ${refundable} ` +
+          `(dibayar ${paidAmount}, sudah direfund ${refundedAmount})`,
+      );
+    }
+    if (plan.total <= 0) {
+      throw new ApiError('VALIDATION_ERROR', 'Total refund harus lebih besar dari 0');
+    }
+
+    // Metode refund: boleh override, default = metode pembayaran terakhir.
+    const methodId = input.method_id ?? money.rows[0]?.method_id ?? null;
+    if (methodId !== null) {
+      await assertMethodUsable(client, methodId);
+    }
+
+    const refundIns = await client.query<{ id: number }>(
+      `INSERT INTO refunds (sale_id, method_id, amount, reason, refunded_by)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [saleId, methodId, plan.total, input.reason, userId],
+    );
+    const refundId = refundIns.rows[0]!.id;
+
+    for (const line of plan.lines) {
       await client.query(
-        `INSERT INTO refunds (sale_id, method_id, amount, reason, refunded_by)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [saleId, paid.rows[0]?.method_id ?? null, paidAmount, reason, userId],
+        `INSERT INTO refund_items (refund_id, sale_item_id, qty, condition, unit_price, subtotal)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [refundId, line.sale_item_id, line.qty, line.condition, line.unit_price, line.subtotal],
       );
     }
 
-    await client.query(`UPDATE sales SET status = 'RETURNED', voided_by = $2, void_reason = $3 WHERE id = $1`, [
+    await insertReturnMovements(client, {
       saleId,
+      lines: plan.lines,
+      referenceType: 'RETURN',
+      noteGood: 'Retur customer',
+      noteDamaged: 'Retur customer - rusak',
       userId,
-      `REFUND: ${reason}`,
-    ]);
+    });
+
+    // Refund penuh (semua item habis) -> tutup penjualan sebagai RETURNED.
+    // Trigger fn_sales_void tetap memvalidasi transisi COMPLETED -> RETURNED.
+    if (plan.full) {
+      await client.query(`UPDATE sales SET status = 'RETURNED', voided_by = $2, void_reason = $3 WHERE id = $1`, [
+        saleId,
+        userId,
+        `REFUND: ${input.reason}`,
+      ]);
+    }
 
     const detail = await fetchDetail(client, saleId);
     return { status: 200, body: detail };

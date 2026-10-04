@@ -7,7 +7,13 @@ import type { ExpenseInput } from '../services/expense.service.js';
 
 /* ------------------------- operational expenses ------------------------ */
 export async function listExpenses(_req: Request, res: Response): Promise<void> {
-  const q = validated<{ month?: string; category?: string; limit: number; offset: number }>(res);
+  const q = validated<{
+    month?: string;
+    category?: string;
+    include_test?: boolean;
+    limit: number;
+    offset: number;
+  }>(res);
   res.status(200).json(await expenseService.listExpenses(q));
 }
 
@@ -30,8 +36,8 @@ export async function getExpense(req: Request, res: Response): Promise<void> {
 
 /* ------------------------------- reports ------------------------------- */
 export async function pnl(_req: Request, res: Response): Promise<void> {
-  const q = validated<{ month: string }>(res);
-  res.status(200).json(await reportService.pnlReport(q.month));
+  const q = validated<{ month: string; include_test?: boolean }>(res);
+  res.status(200).json(await reportService.pnlReport(q.month, { includeTest: q.include_test }));
 }
 
 export async function dashboard(_req: Request, res: Response): Promise<void> {
@@ -40,4 +46,10 @@ export async function dashboard(_req: Request, res: Response): Promise<void> {
 
 export async function alerts(_req: Request, res: Response): Promise<void> {
   res.status(200).json(await reportService.alerts());
+}
+
+/** Laporan analisa opname bulanan (OWNER). */
+export async function opnameReport(_req: Request, res: Response): Promise<void> {
+  const q = validated<{ month: string }>(res);
+  res.status(200).json(await reportService.opnameReport(q.month));
 }

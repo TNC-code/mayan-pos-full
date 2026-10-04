@@ -1,12 +1,24 @@
 openapi: 3.0.3
 info:
   title: POS Inventory API
-  version: 1.0.0
+  version: 2.1.0
   description: |
     POS Inventory multi-terminal (2+ POS / multi user, ACID via PostgreSQL).
     Aturan bisnis ditegakkan DB (trigger): anti-oversell, harga jual >= harga beli,
     anti-overpay, void auditable. Pembayaran mendukung PARTIAL & multi metode
     (CASH / BANK_TRANSFER / configurable via menu payment_methods).
+
+    **RBAC v2** — KASIR = operator (semua mutasi: master, pembelian, POS, opname, opex,
+    payment-methods, profil toko), OWNER = monitor read-only (403 di semua mutasi).
+    `GET /expenses`, `GET /expenses/{id}` dan seluruh `/reports/*` hanya OWNER.
+    Semua GET lain terbuka untuk kedua role.
+
+    **Pemisahan data uji (v2.1)** — `sales`, `operational_expenses` dan `supplier_returns`
+    punya flag `is_test`; semua laporan production-only mengecualikannya secara default dan
+    membuka lewat `?include_test=true` (`GET /sales`, `GET /expenses`, `GET /reports/pnl`).
+  x-rbac: |
+    KASIR: semua POST/PATCH/DELETE. OWNER: semua GET kecuali tidak ada (OWNER juga
+    boleh baca semua GET), namun OWNER tidak boleh melakukan mutasi apa pun.
 servers:
   - url: http://localhost:3000/api/v1
     description: Local
@@ -20,10 +32,22 @@ tags:
   - name: Payments
   - name: Stock
   - name: Opnames
+  - name: Supplier Returns
   - name: Expenses
   - name: Reports
 security:
   - bearerAuth: []
+
+x-error-codes:
+  REFUND_QTY_EXCEEDED: '422 - qty refund melebihi sisa item yang terjual'
+  REFUND_AMOUNT_EXCEEDED: '422 - total refund melebihi sisa uang yang dibayar'
+  REFUND_NOT_ALLOWED: '422 - sales UNPAID; gunakan void'
+  VOID_ITEM_MISMATCH: '422 - sale_item_id bukan item dari penjualan tsb / refund tanpa item'
+  DAMAGED_QTY_INSUFFICIENT: '409 - qty_damaged batch tidak cukup (retur distributor / opname)'
+  SUPPLIER_RETURN_SETTLED: '409 - retur distributor sudah REFUNDED/WRITTEN_OFF'
+  TRANSITION_NOT_ALLOWED: '409 - status sales tidak dapat diubah lagi'
+  VOID_NOT_ALLOWED: '409 - sales sudah dibayar; gunakan retur/refund'
+  FORBIDDEN: '403 - role tidak berwenang (RBAC)'
 
 paths:
   /auth/login:
@@ -148,7 +172,7 @@ paths:
                 items: { $ref: '#/components/schemas/Product' }
     post:
       tags: [Products]
-      summary: Tambah produk
+      summary: Tambah produk — KASIR only
       requestBody:
         required: true
         content:
@@ -176,7 +200,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Products]
-      summary: Ubah produk
+      summary: Ubah produk — KASIR only
       requestBody:
         required: true
         content:
@@ -191,7 +215,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
       tags: [Products]
-      summary: Nonaktifkan produk (soft, stok histori tetap)
+      summary: Nonaktifkan produk (soft, stok histori tetap) — KASIR only
       responses:
         '200':
           description: OK
@@ -217,7 +241,7 @@ paths:
                 items: { $ref: '#/components/schemas/Category' }
     post:
       tags: [Categories]
-      summary: Tambah kategori
+      summary: Tambah kategori — KASIR only
       requestBody:
         content:
           application/json:
@@ -238,7 +262,7 @@ paths:
   /categories/{id}:
     patch:
       tags: [Categories]
-      summary: Ubah kategori
+      summary: Ubah kategori — KASIR only
       parameters: [{ $ref: '#/components/parameters/Id' }]
       requestBody:
         required: true
@@ -275,7 +299,7 @@ paths:
                     name: { type: string }
     post:
       tags: [Categories]
-      summary: Tambah tipe produk
+      summary: Tambah tipe produk — KASIR only
       requestBody:
         required: true
         content:
@@ -310,7 +334,7 @@ paths:
                 items: { $ref: '#/components/schemas/Customer' }
     post:
       tags: [Products]
-      summary: Tambah customer
+      summary: Tambah customer — KASIR only
       requestBody:
         required: true
         content:
@@ -337,7 +361,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Products]
-      summary: Ubah customer
+      summary: Ubah customer — KASIR only
       requestBody:
         required: true
         content:
@@ -366,7 +390,7 @@ paths:
                 items: { $ref: '#/components/schemas/PaymentMethod' }
     post:
       tags: [Payment Methods]
-      summary: Tambah metode (mis. QRIS) — OWNER only
+      summary: Tambah metode (mis. QRIS) — KASIR only
       requestBody:
         required: true
         content:
@@ -393,7 +417,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Payment Methods]
-      summary: Ubah / aktif-nonaktifkan / set rekening bank — OWNER only
+      summary: Ubah / aktif-nonaktifkan / set rekening bank — KASIR only
       requestBody:
         required: true
         content:
@@ -420,7 +444,7 @@ paths:
                 items: { $ref: '#/components/schemas/StockBatch' }
     post:
       tags: [Purchases]
-      summary: Catat pembelian bulk (1 batch + movement IN, atomic)
+      summary: Catat pembelian bulk (1 batch + movement IN, atomic) — KASIR only
       requestBody:
         required: true
         content:
@@ -464,7 +488,7 @@ paths:
                 items: { $ref: '#/components/schemas/Sale' }
     post:
       tags: [Sales]
-      summary: Buat penjualan (POS checkout) — atomic + idempotent
+      summary: Buat penjualan (POS checkout) — atomic + idempotent — KASIR only
       description: |
         Satu request = 1 DB transaction (sales + items + payment awal optional).
         Gunakan header Idempotency-Key (UUID per submit) agar retry tidak dobel transaksi.
@@ -501,25 +525,31 @@ paths:
   /sales/{id}/void:
     post:
       tags: [Sales]
-      summary: Void penjualan (stok kembali, auditable)
-      description: Ditolak (409) jika sudah ada pembayaran atau status bukan COMPLETED.
+      summary: Void penjualan berlabel kondisi (stok kembali, auditable) — KASIR only
+      description: |
+        Hanya untuk penjualan **UNPAID** (yang sudah dibayar wajib lewat refund).
+        Tanpa `items` = void penuh semua item kondisi GOOD (perilaku lama, kompatibel FE lama).
+        Dengan `items` = hanya item yang disebut yang kembali, dan `condition` menentukan
+        kolom stok mana yang bertambah: GOOD -> `qty_remaining` (bisa dijual lagi),
+        RUSAK -> `qty_damaged` (karantina, tidak ikut terjual).
+        Semua movement tercatat di `stock_movements` dengan `reference_type='VOID'`.
       parameters: [{ $ref: '#/components/parameters/Id' }]
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [reason]
-              properties:
-                reason: { type: string }
+            schema: { $ref: '#/components/schemas/ReturnItemsInput' }
       responses:
         '200':
           description: OK — status VOIDED, movement IN tercatat
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SaleDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /sales/{id}/receipt:
     get:
@@ -546,7 +576,7 @@ paths:
               schema: { $ref: '#/components/schemas/StoreProfile' }
     patch:
       tags: [Auth]
-      summary: Ubah profil toko — OWNER only
+      summary: Ubah profil toko — KASIR only
       requestBody:
         required: true
         content:
@@ -558,15 +588,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/StoreProfile' }
-        '403': { description: KASIR tidak diizinkan }
+        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
 
   /sales/{id}/refund:
     post:
       tags: [Sales]
-      summary: Retur + refund (PAID maupun UNPAID)
+      summary: Retur + refund parsial / berlabel kondisi (PAID) — KASIR only
       description: |
-        Sale PAID: uang dikembalikan (tercatat di tabel refunds, metode = pembayaran terakhir),
-        status -> RETURNED, stok kembali. Sale UNPAID: hanya retur. Void PAID tetap ditolak (409).
+        Retur untuk penjualan yang **sudah dibayar**: uang dicatat di tabel `refunds`,
+        barang kembali ke gudang per item dan per kondisi.
+        Tanpa `items` = refund penuh semua sisa item, semua GOOD (perilaku lama, kompatibel FE lama).
+        Dengan `items` = refund **parsial** (`qty` boleh sebagian dari qty jual) dan
+        `condition` GOOD/RUSAK per item (boleh campur untuk satu sale_item).
+        `method_id` opsional; default = metode pembayaran terakhir.
+        Status: parsial -> tetap `COMPLETED` (hanya `refunded_amount` naik);
+        semua item habis -> `RETURNED`.
+        Penjualan UNPAID ditolak 422 (`REFUND_NOT_ALLOWED`) — pakai void.
       parameters:
         - { $ref: '#/components/parameters/Id' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -574,18 +611,18 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [reason]
-              properties:
-                reason: { type: string }
+            schema: { $ref: '#/components/schemas/ReturnItemsInput' }
       responses:
         '200':
-          description: OK — status RETURNED + refund record
+          description: OK — refund record + detail per item + status (COMPLETED/RETURNED)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SaleDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /cash-sessions:
     get:
@@ -606,7 +643,7 @@ paths:
   /cash-sessions/open:
     post:
       tags: [Payments]
-      summary: Buka shift kasir (saldo awal kas)
+      summary: Buka shift kasir (saldo awal kas) — KASIR only
       requestBody:
         required: true
         content:
@@ -640,7 +677,7 @@ paths:
   /cash-sessions/{id}/close:
     post:
       tags: [Payments]
-      summary: Tutup shift — expected_cash = awal + CASH masuk - refund CASH; selisih otomatis
+      summary: Tutup shift — expected_cash = awal + CASH masuk - refund CASH; selisih otomatis — KASIR only
       parameters: [{ $ref: '#/components/parameters/Id' }]
       requestBody:
         required: true
@@ -669,7 +706,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Dashboard' }
-        '403': { description: KASIR tidak diizinkan }
+        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
 
   /alerts:
     get:
@@ -697,7 +734,7 @@ paths:
                 items: { $ref: '#/components/schemas/Payment' }
     post:
       tags: [Payments]
-      summary: Tambah pembayaran (DP / pelunasan — PARTIAL didukung)
+      summary: Tambah pembayaran (DP / pelunasan — PARTIAL didukung) — KASIR only
       description: |
         Bisa dipanggil berkali-kali sampai lunas. payment_status sale otomatis
         UNPAID → PARTIAL → PAID. Overpay ditolak 422. BANK_TRANSFER wajib reference_no.
@@ -720,9 +757,20 @@ paths:
     get:
       tags: [Stock]
       summary: Stok on hand semua produk (query langsung product JOIN stock_batches, tanpa view)
+      description: |
+        `qty_on_hand` = HANYA barang GOOD (itu yang boleh terjual POS).
+        `qty_damaged` = barang rusak karantina (hasil refund/void RUSAK, belum diretur distributor).
+        `physical_total` = qty_on_hand + qty_damaged (seluruh barang yang masih ada di gudang).
       parameters:
         - { name: product_id, in: query, schema: { type: integer } }
+        - { name: category_id, in: query, schema: { type: integer } }
+        - { name: q, in: query, schema: { type: string }, description: 'nama/sku/barcode' }
+        - { name: active_only, in: query, schema: { type: boolean } }
         - { name: expiring_in_days, in: query, schema: { type: integer }, description: filter near-expiry }
+        - { name: in_stock_only, in: query, schema: { type: boolean } }
+        - { name: damaged_only, in: query, schema: { type: boolean }, description: 'hanya produk yang punya qty_damaged > 0 (layan "siap diretur")' }
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses:
         '200':
           description: OK
@@ -732,14 +780,45 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/ProductStock' }
 
+  /stock/damaged:
+    get:
+      tags: [Stock]
+      summary: Daftar stok rusak per BATCH — bahan baku layar retur ke distributor
+      description: |
+        Satu baris per `stock_batches` dengan `qty_damaged > 0`. Tiap baris langsung
+        bisa dipakai sebagai item `POST /supplier-returns` (`batch_id` + `qty` + `unit_cost`).
+        Semua role boleh baca; mutasi returnya KASIR only.
+      parameters:
+        - { name: product_id, in: query, schema: { type: integer } }
+        - { name: q, in: query, schema: { type: string }, description: 'nama/sku/batch_code' }
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DamagedStock' }
+
   /stock/movements:
     get:
       tags: [Stock]
       summary: Ledger pergerakan stok (immutable, audit)
+      description: |
+        `condition` = GOOD (barang sellable, mengubah `qty_remaining`) atau
+        RUSAK (karantina, mengubah `qty_damaged`). Filter `condition` dipakai untuk
+        memisahkan jejak barang jual vs barang rusak.
       parameters:
         - { name: product_id, in: query, schema: { type: integer } }
+        - { name: batch_id, in: query, schema: { type: integer } }
         - { name: type, in: query, schema: { type: string, enum: [IN, OUT, ADJUSTMENT] } }
+        - { name: reference_type, in: query, schema: { type: string, example: SALE }, description: 'PURCHASE / SALE / VOID / RETURN / OPNAME / SUPPLIER_RETURN / CORRECTION' }
+        - { name: reference_id, in: query, schema: { type: integer } }
+        - { name: condition, in: query, schema: { type: string, enum: [GOOD, RUSAK] } }
         - { name: limit, in: query, schema: { type: integer, default: 100 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses:
         '200':
           description: OK
@@ -768,6 +847,8 @@ paths:
       summary: Riwayat stok opname
       parameters:
         - { name: date, in: query, schema: { type: string, format: date } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses:
         '200':
           description: OK
@@ -778,7 +859,17 @@ paths:
                 items: { $ref: '#/components/schemas/Opname' }
     post:
       tags: [Opnames]
-      summary: Simpan opname harian (system_qty auto, input physical_qty)
+      summary: 'Simpan opname harian (system_qty GOOD + RUSAK auto, input physical) — KASIR only'
+      description: |
+        `system_qty` (barang GOOD) dan `system_qty_damaged` (barang RUSAK) dibaca dari
+        agregat `stock_batches` saat opname lalu disimpan sebagai snapshot, sehingga laporan
+        bulan lalu tidak berubah karena penjualan sesudahnya.
+        `physical_qty_damaged` opsional — kosong = dianggap sama dengan sistem (tanpa
+        adjustment barang rusak). Selisih GOOD != 0 -> movement ADJUSTMENT condition GOOD;
+        selisih RUSAK != 0 -> movement ADJUSTMENT condition RUSAK.
+        `cause` opsional: RUSAK | HILANG | SALAH_HITUNG | LAIN.
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyOptional' }
       requestBody:
         required: true
         content:
@@ -790,11 +881,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Opname' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /opnames/{id}:
     get:
       tags: [Opnames]
-      summary: Detail opname
+      summary: 'Detail opname (per item: unit_cost, value_difference, cause)'
       parameters: [{ $ref: '#/components/parameters/Id' }]
       responses:
         '200':
@@ -808,9 +901,16 @@ paths:
     get:
       tags: [Expenses]
       summary: List pengeluaran operasional (OWNER only)
+      description: |
+        Kasir boleh MENGINPUT opex (`POST`) tapi tidak boleh membacanya (403).
+        Opex dari skrip uji (`is_test`) disembunyikan secara default;
+        `?include_test=true` untuk melihat semuanya.
       parameters:
         - { name: month, in: query, schema: { type: string, example: '2026-10' }, description: 'filter YYYY-MM' }
         - { name: category, in: query, schema: { type: string, example: LISTRIK } }
+        - { name: include_test, in: query, schema: { type: boolean, default: false }, description: 'sertakan opex data uji' }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses:
         '200':
           description: OK
@@ -819,10 +919,12 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Expense' }
-        '403': { description: KASIR tidak diizinkan }
+        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
     post:
       tags: [Expenses]
-      summary: Catat pengeluaran operasional — gaji/listrik/internet (OWNER only)
+      summary: Catat pengeluaran operasional — gaji/listrik/internet (KASIR only)
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKeyOptional' }
       requestBody:
         required: true
         content:
@@ -834,7 +936,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Expense' }
-        '403': { description: KASIR tidak diizinkan }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
 
   /expenses/{id}:
     parameters: [{ $ref: '#/components/parameters/Id' }]
@@ -847,10 +949,11 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Expense' }
+        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Expenses]
-      summary: Update/koreksi pengeluaran (OWNER only)
+      summary: Update/koreksi pengeluaran (KASIR only)
       requestBody:
         required: true
         content:
@@ -862,6 +965,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Expense' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /reports/pnl:
@@ -869,8 +974,39 @@ paths:
       tags: [Reports]
       summary: Laporan laba-rugi periode bulanan (OWNER only)
       description: |
-        laba_kotor = pendapatan - HPP; laba_bersih = laba_kotor - beban operasional;
-        laba_netto = laba_bersih (pajak belum dimodelkan). Basis akrual (sales COMPLETED).
+        laba_kotor = pendapatan - HPP;
+        laba_bersih = laba_kotor + **refund_distributor** - beban_operasional;
+        laba_netto = laba_bersih (pajak belum dimodelkan).
+        Basis akrual (sales COMPLETED periode, TZ Asia/Jakarta).
+        `refund_distributor` = uang yang dikembalikan distributor atas retur barang rusak
+        (`supplier_returns` status REFUNDED, dihitung per bulan `refunded_at`) — sifatnya
+        pendapatan lain karena barangnya sudah jadi HPP saat terjual.
+        Retur yang **ditolak** distributor tidak muncul di sini: opex `BARANG_RUSAK`-nya
+        otomatis tercatat di `operational_expenses`.
+        Data uji (`is_test` pada `sales`, `operational_expenses` **dan** `supplier_returns`)
+        dikecualikan dari seluruh laporan; `?include_test=true` menghitung semuanya.
+      parameters:
+        - { name: month, in: query, required: true, schema: { type: string, example: '2026-10' } }
+        - { name: include_test, in: query, schema: { type: boolean, default: false }, description: 'sertakan data uji (sales + opex + retur distributor)' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PnlReport' }
+        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+
+  /reports/opname:
+    get:
+      tags: [Reports]
+      summary: Laporan analisa opname bulanan (OWNER only)
+      description: |
+        Rekap selisih opname satu bulan: total frekuensi & qty selisih (GOOD & RUSAK),
+        nilai selisih dalam rupiah, rincian per `cause` & per kategori produk, 10 produk
+        dengan |nilai selisih| terbesar, tren 6 bulan, serta stok rusak yang belum diretur
+        (termasuk retur distributor berstatus PENDING).
+        Semua angka dihitung ulang dari snapshot `stock_opname_items`, bukan dari stok
+        saat ini.
       parameters:
         - { name: month, in: query, required: true, schema: { type: string, example: '2026-10' } }
       responses:
@@ -878,8 +1014,106 @@ paths:
           description: OK
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/PnlReport' }
-        '403': { description: KASIR tidak diizinkan }
+              schema: { $ref: '#/components/schemas/OpnameReport' }
+        '403': { description: "OWNER tidak diizinkan (RBAC v2 - kasir = operator)" }
+
+  /supplier-returns:
+    get:
+      tags: [Supplier Returns]
+      summary: Riwayat retur ke distributor (barang rusak karantina)
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, REFUNDED, WRITTEN_OFF] } }
+        - { name: supplier_name, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string }, description: 'return_no / supplier_name' }
+        - { name: date_from, in: query, schema: { type: string, format: date } }
+        - { name: date_to, in: query, schema: { type: string, format: date } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SupplierReturn' }
+    post:
+      tags: [Supplier Returns]
+      summary: 'Buat retur ke distributor dari stok rusak — KASIR only'
+      description: |
+        Satu transaksi DB: kunci tiap batch (FOR UPDATE) + validasi `qty <= qty_damaged`,
+        insert header (`RTR-YYYYMMDD-NNN`, status PENDING, `total_cost` = Σ qty × unit_cost)
+        + item + movement OUT `condition='RUSAK'` `reference_type='SUPPLIER_RETURN'`
+        (trigger DB yang mengurang `qty_damaged`; aplikasi tidak menghitung stok sendiri).
+        `batch_id` tidak boleh dobel dalam 1 request. Gunakan `GET /stock/damaged` untuk
+        mengetahui batch & qty yang siap diretur.
+        `is_test` opsional: tandai retur sebagai data uji sejak awal (default `false` = produksi).
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupplierReturnInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierReturnDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '409':
+          description: 'DAMAGED_QTY_INSUFFICIENT / BATCH_NOT_FOUND (stok rusak batch tidak cukup)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /supplier-returns/{id}:
+    get:
+      tags: [Supplier Returns]
+      summary: Detail retur distributor (items + opex write-off bila ada)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierReturnDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /supplier-returns/{id}/settle:
+    post:
+      tags: [Supplier Returns]
+      summary: 'Selesaikan retur distributor — KASIR only'
+      description: |
+        Dua hasil yang tidak boleh tertukar (discriminated union `result`):
+        * `REFUNDED` — distributor mengembalikan uang: isi `refunded_amount`
+          (`<= total_cost`), `refunded_method_id`, `refunded_at`. Uang ini menjadi
+          **pendapatan lain** di P&L bulan `refunded_at`.
+        * `WRITTEN_OFF` — distributor menolak: status `WRITTEN_OFF` + **otomatis** insert
+          `operational_expenses` kategori `BARANG_RUSAK`, `source='SUPPLIER_RETURN'`,
+          ter-link ke retur ini,(amount = `total_cost`) dalam transaksi yang sama.
+        Guard: status harus PENDING, selain itu `409 SUPPLIER_RETURN_SETTLED`.
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SupplierReturnSettleInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SupplierReturnDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: 'SUPPLIER_RETURN_SETTLED — retur sudah diselesaikan' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
 components:
   securitySchemes:
@@ -900,6 +1134,12 @@ components:
       required: true
       schema: { type: string, format: uuid }
       description: UUID unik per submit; retry dengan key sama tidak mengeksekusi ulang
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+      description: Accepted bila dikirim; tidak diwajibkan untuk endpoint ini
 
   responses:
     Unauthorized:
@@ -912,13 +1152,18 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Body tidak valid (zod / Idempotency-Key tidak sah)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     Conflict:
-      description: Konflik (stok kurang / void tidak diizinkan)
+      description: 'Konflik (stok kurang / void tidak diizinkan / REFUND_QTY_EXCEEDED qty / DAMAGED_QTY_INSUFFICIENT)'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Unprocessable:
-      description: Aturan bisnis dilanggar (harga < beli, overpay, reference_no kosong, metode nonaktif)
+      description: 'Aturan bisnis dilanggar (harga < beli, overpay, reference_no kosong, metode nonaktif, REFUND_QTY_EXCEEDED, VOID_ITEM_MISMATCH)'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -929,6 +1174,9 @@ components:
       properties:
         error: { type: string }
         code: { type: string }
+      example:
+        error: 'Qty refund melebihi sisa item: sale_item_id=12, terjual 3, sudah direfund 1, diminta 5'
+        code: REFUND_QTY_EXCEEDED
 
     StoreProfile:
       type: object
@@ -1041,14 +1289,42 @@ components:
       properties:
         id: { type: integer }
         product_id: { type: integer }
-        batch_id: { type: integer }
+        product_name: { type: string, nullable: true }
+        batch_id: { type: integer, nullable: true }
+        batch_code: { type: string, nullable: true }
         movement_type: { type: string, enum: [IN, OUT, ADJUSTMENT] }
-        qty_change: { type: number, description: bertanda (+IN / -OUT) }
+        qty_change: { type: number, description: bertanda (+IN / -OUT); ADJUSTMENT bisa +/- }
         unit_cost: { type: number }
-        reference_type: { type: string, example: SALE }
-        reference_id: { type: integer }
+        reference_type:
+          type: string
+          example: SALE
+          description: 'PURCHASE / SALE / VOID / RETURN / OPNAME / SUPPLIER_RETURN / CORRECTION'
+        reference_id: { type: integer, nullable: true }
         note: { type: string, nullable: true }
+        created_by: { type: integer, nullable: true }
+        created_by_name: { type: string, nullable: true }
         created_at: { type: string, format: date-time }
+        condition:
+          type: string
+          enum: [GOOD, RUSAK]
+          description: 'GOOD -> qty_remaining; RUSAK -> qty_damaged (karantina)'
+
+    DamagedStock:
+      type: object
+      description: Satu baris per batch dengan barang rusak yang siap diretur ke distributor.
+      properties:
+        batch_id: { type: integer }
+        batch_code: { type: string, example: GRN-20261004-032 }
+        product_id: { type: integer }
+        product_name: { type: string }
+        sku: { type: string, nullable: true }
+        unit: { type: string, nullable: true }
+        qty_damaged: { type: number, example: 2.000 }
+        unit_cost: { type: number, format: float, example: 10000.00 }
+        value: { type: number, format: float, description: 'qty_damaged x unit_cost' }
+        expired_date: { type: string, format: date, nullable: true }
+        supplier: { type: string, nullable: true }
+        received_at: { type: string, format: date-time }
 
     CashSession:
       type: object
@@ -1151,7 +1427,9 @@ components:
         barcode: { type: string, nullable: true }
         name: { type: string }
         unit: { type: string }
-        qty_on_hand: { type: number, example: 16.000 }
+        qty_on_hand: { type: number, example: 16.000, description: 'barang GOOD saja (boleh terjual)' }
+        qty_damaged: { type: number, example: 2.000, description: 'barang rusak karantina (belum diretur)' }
+        physical_total: { type: number, example: 18.000, description: 'qty_on_hand + qty_damaged' }
         nearest_expiry: { type: string, format: date, nullable: true }
 
     StockBatch:
@@ -1162,6 +1440,7 @@ components:
         product_id: { type: integer }
         qty_received: { type: number, example: 20.000 }
         qty_remaining: { type: number, example: 16.000 }
+        qty_damaged: { type: number, example: 2.000, description: 'barang rusak karantina pada batch ini' }
         unit_cost: { type: number, format: float, example: 40000.00 }
         expired_date: { type: string, format: date, nullable: true }
         supplier: { type: string, nullable: true }
@@ -1256,18 +1535,176 @@ components:
               items:
                 type: object
                 properties:
+                  id: { type: integer }
                   product_id: { type: integer }
                   product_name: { type: string }
+                  unit: { type: string, nullable: true }
                   batch_id: { type: integer }
+                  batch_code: { type: string, nullable: true }
                   qty: { type: number, example: 4.000 }
                   unit_price: { type: number, example: 50000.00 }
                   unit_cost: { type: number, description: snapshot harga beli batch }
                   subtotal: { type: number }
+                  note: { type: string, nullable: true }
             payments:
               type: array
               items: { $ref: '#/components/schemas/Payment' }
+            refunds:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  method_code: { type: string, nullable: true }
+                  amount: { type: number, format: float }
+                  reason: { type: string }
+                  refunded_at: { type: string, format: date-time }
+                  refunded_by_name: { type: string, nullable: true }
+            refund_items:
+              type: array
+              description: |
+                Detail refund per item (v2). `qty` boleh parsial terhadap qty jual;
+                `condition` menentukan kolom stok yang bertambah (GOOD -> qty_remaining,
+                RUSAK -> qty_damaged karantina); `subtotal` = qty x unit_price snapshot.
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  refund_id: { type: integer }
+                  sale_item_id: { type: integer }
+                  qty: { type: number, example: 1.000 }
+                  condition: { type: string, enum: [GOOD, RUSAK] }
+                  unit_price: { type: number, example: 50000.00 }
+                  subtotal: { type: number, example: 50000.00 }
             paid_amount: { type: number, example: 100000.00 }
+            refunded_amount: { type: number, example: 50000.00 }
             due_amount: { type: number, example: 100000.00 }
+
+    ReturnItemsInput:
+      type: object
+      required: [reason]
+      description: |
+        Body bersama untuk `POST /sales/{id}/void` dan `POST /sales/{id}/refund`.
+        Tanpa `items` = penuh: void -> semua item GOOD; refund -> semua sisa item GOOD.
+        Dengan `items` = sebagian (refund) / berlabel kondisi (void & refund).
+      properties:
+        reason: { type: string, minLength: 3, maxLength: 500 }
+        method_id:
+          type: integer
+          nullable: true
+          description: 'hanya refund; default = metode pembayaran terakhir'
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [sale_item_id]
+            properties:
+              sale_item_id: { type: integer }
+              qty:
+                type: number
+                description: 'hanya refund; qty dikembalikan (<= sisa qty jual). Void mengabaikannya (void selalu utuh)'
+              condition:
+                type: string
+                enum: [GOOD, RUSAK]
+                default: GOOD
+                description: 'GOOD -> qty_remaining (bisa dijual lagi); RUSAK -> qty_damaged (karantina)'
+
+    SupplierReturn:
+      type: object
+      properties:
+        id: { type: integer }
+        return_no: { type: string, example: RTR-20261004-001 }
+        supplier_name: { type: string }
+        status: { type: string, enum: [PENDING, REFUNDED, WRITTEN_OFF] }
+        total_cost: { type: number, format: float, description: 'sum(qty x unit_cost)' }
+        refunded_amount: { type: number, format: float, nullable: true }
+        refunded_method_id: { type: integer, nullable: true }
+        refunded_method_code: { type: string, nullable: true }
+        refunded_method_name: { type: string, nullable: true }
+        refund_reference_no: { type: string, nullable: true }
+        refunded_at: { type: string, format: date-time, nullable: true }
+        settled_by: { type: integer, nullable: true }
+        settled_by_name: { type: string, nullable: true }
+        note: { type: string, nullable: true }
+        created_by: { type: integer, nullable: true }
+        created_by_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        is_test:
+          type: boolean
+          default: false
+          description: >
+            true = retur dari skrip uji. Dikecualikan dari `refund_distributor` P&L
+            (default disembunyikan, `?include_test=true` memunculkan lagi).
+        item_count: { type: integer }
+        total_qty: { type: number }
+
+    SupplierReturnDetail:
+      allOf:
+        - $ref: '#/components/schemas/SupplierReturn'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: integer }
+                  product_id: { type: integer }
+                  product_name: { type: string }
+                  unit: { type: string, nullable: true }
+                  batch_id: { type: integer, nullable: true }
+                  batch_code: { type: string, nullable: true }
+                  qty: { type: number }
+                  unit_cost: { type: number, format: float }
+                  condition: { type: string, enum: [GOOD, RUSAK] }
+                  subtotal: { type: number, format: float }
+            write_off_expense:
+              nullable: true
+              allOf: [{ $ref: '#/components/schemas/Expense' }]
+              description: 'Opex otomatis dari settle WRITTEN_OFF; null bila belum disettle / REFUNDED'
+
+    SupplierReturnInput:
+      type: object
+      required: [supplier_name, items]
+      properties:
+        supplier_name: { type: string, maxLength: 200 }
+        note: { type: string, nullable: true }
+        is_test:
+          type: boolean
+          default: false
+          description: >
+            Opsional. Tandai retur sebagai data uji sejak awal (e2e/agen skrip), supaya tidak
+            harus menunggu `npm run mark-test-data`. Opex write-off turunannya mewarisi nilai ini.
+        items:
+          type: array
+          minItems: 1
+          description: '`batch_id` tidak boleh muncul lebih dari sekali dalam 1 request'
+          items:
+            type: object
+            required: [batch_id, qty]
+            properties:
+              batch_id: { type: integer, description: 'batch dari `GET /stock/damaged`' }
+              qty: { type: number, description: '<= qty_damaged batch, selain itu 409' }
+              unit_cost: { type: number, nullable: true, description: 'default = unit_cost batch' }
+
+    SupplierReturnSettleInput:
+      oneOf:
+        - title: REFUNDED (distributor mengembalikan uang)
+          type: object
+          required: [result, amount]
+          properties:
+            result: { type: string, enum: [REFUNDED] }
+            amount: { type: number, format: float, description: '> 0 dan <= total_cost' }
+            method_id: { type: integer, nullable: true, description: 'metode pembayaran masuk (harus aktif)' }
+            reference_no: { type: string, nullable: true }
+            note: { type: string, nullable: true }
+        - title: WRITTEN_OFF (distributor menolak -> jadi opex BARANG_RUSAK)
+          type: object
+          required: [result]
+          properties:
+            result: { type: string, enum: [WRITTEN_OFF] }
+            note: { type: string, nullable: true }
 
     Payment:
       type: object
@@ -1302,30 +1739,130 @@ components:
       type: object
       properties:
         id: { type: integer }
-        opname_no: { type: string }
+        opname_no: { type: string, example: OPN-20261004-001 }
         opname_date: { type: string, format: date }
+        note: { type: string, nullable: true }
+        created_by: { type: integer, nullable: true }
+        created_by_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        item_count: { type: integer }
+        total_difference: { type: number, description: 'sum selisih GOOD' }
+        total_difference_damaged: { type: number, description: 'sum selisih RUSAK' }
+        total_value_difference: { type: number, format: float, description: 'nilai rupiah selisih total (GOOD+RUSAK); negatif = rugi' }
+        total_loss_value: { type: number, format: float, description: 'nilai rugi (nilai total < 0)' }
+        total_gain_value: { type: number, format: float, description: 'nilai lebih (nilai total > 0)' }
         items:
           type: array
           items:
             type: object
             properties:
+              id: { type: integer }
               product_id: { type: integer }
-              system_qty: { type: number }
+              product_name: { type: string }
+              unit: { type: string, nullable: true }
+              batch_id: { type: integer, nullable: true }
+              batch_code: { type: string, nullable: true }
+              system_qty: { type: number, description: 'snapshot stok GOOD saat opname' }
               physical_qty: { type: number }
-              difference: { type: number }
+              difference: { type: number, description: 'physical_qty - system_qty (GOOD)' }
+              system_qty_damaged: { type: number, description: 'snapshot stok RUSAK saat opname' }
+              physical_qty_damaged: { type: number, description: 'kosong pada input = sama dengan sistem' }
+              damaged_difference: { type: number, description: 'selisih RUSAK (COALESCE(physical,system) - system)' }
+              cause: { type: string, nullable: true, enum: [RUSAK, HILANG, SALAH_HITUNG, LAIN, null] }
+              unit_cost: { type: number, format: float, description: 'acuan: unit_cost batch, fallback rata-rata tertimbang produk' }
+              value_difference: { type: number, format: float, description: 'difference x unit_cost' }
+              value_difference_damaged: { type: number, format: float, description: 'damaged_difference x unit_cost' }
+              value_difference_total: { type: number, format: float }
+              note: { type: string, nullable: true }
 
     OpnameInput:
       type: object
       required: [items]
       properties:
+        note: { type: string, nullable: true }
         items:
           type: array
+          minItems: 1
           items:
             type: object
             required: [product_id, physical_qty]
             properties:
               product_id: { type: integer }
-              physical_qty: { type: number }
+              physical_qty: { type: number, min: 0 }
+              physical_qty_damaged:
+                type: number
+                min: 0
+                nullable: true
+                description: 'kosong = dianggap sama dengan sistem (tanpa adjustment barang rusak)'
+              cause: { type: string, nullable: true, enum: [RUSAK, HILANG, SALAH_HITUNG, LAIN] }
+              batch_id: { type: integer, nullable: true, description: 'opsional: opname per batch, bukan agregat produk' }
+              note: { type: string, nullable: true }
+
+    OpnameReport:
+      type: object
+      description: Laporan analisa opname bulanan (OWNER). Semua angka dihitung dari snapshot saat opname.
+      properties:
+        period: { type: string, example: '2026-10' }
+        total:
+          type: object
+          properties:
+            opname_count: { type: integer }
+            item_count: { type: integer }
+            selisih_qty: { type: number, description: 'sum selisih GOOD' }
+            selisih_qty_damaged: { type: number, description: 'sum selisih RUSAK' }
+            nilai_selisih: { type: number, format: float }
+            nilai_rugi: { type: number, format: float }
+            nilai_lebih: { type: number, format: float }
+        per_cause:
+          type: array
+          items:
+            type: object
+            properties:
+              cause: { type: string }
+              item_count: { type: integer }
+              selisih_qty: { type: number }
+              selisih_qty_damaged: { type: number }
+              nilai_selisih: { type: number, format: float }
+              nilai_selisih_damaged: { type: number, format: float }
+        per_kategori:
+          type: array
+          items:
+            type: object
+            properties:
+              category_id: { type: integer, nullable: true }
+              category: { type: string }
+              selisih_qty: { type: number }
+              selisih_qty_damaged: { type: number }
+              nilai_selisih: { type: number, format: float }
+        top_produk:
+          type: array
+          description: 10 produk dengan |nilai selisih| terbesar
+          items:
+            type: object
+            properties:
+              product_id: { type: integer }
+              name: { type: string }
+              selisih_qty: { type: number }
+              selisih_qty_damaged: { type: number }
+              nilai_selisih: { type: number, format: float }
+        tren_6_bulan:
+          type: array
+          items:
+            type: object
+            properties:
+              month: { type: string, example: '2026-08' }
+              opname_count: { type: integer }
+              selisih_qty: { type: number }
+              nilai_selisih: { type: number, format: float }
+        stok_rusak_belum_diretur:
+          type: object
+          properties:
+            qty: { type: number }
+            nilai: { type: number, format: float }
+            batch_count: { type: integer }
+            pending_return_count: { type: integer, description: 'retur distributor berstatus PENDING' }
+            pending_return_value: { type: number, format: float }
+        note: { type: string }
 
     Expense:
       type: object
@@ -1335,8 +1872,16 @@ components:
         category: { type: string, example: GAJI_KARYAWAN }
         description: { type: string, nullable: true }
         amount: { type: number, format: float, example: 3500000.00 }
+        created_by: { type: integer, nullable: true }
         created_by_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        source:
+          type: string
+          enum: [MANUAL, SUPPLIER_RETURN]
+          description: 'SUPPLIER_RETURN = otomatis dari settle WRITTEN_OFF retur distributor'
+        supplier_return_id: { type: integer, nullable: true }
+        is_test: { type: boolean, description: 'true = data uji; dikecualikan dari daftar default & P&L' }
 
     ExpenseInput:
       type: object
@@ -1365,7 +1910,18 @@ components:
               total_amount: { type: number }
               count: { type: integer }
         total_beban_operasional: { type: number }
-        laba_bersih: { type: number }
-        laba_netto: { type: number }
+        refund_distributor:
+          type: number
+          format: float
+          description: >
+            Pendapatan lain: Σ refunded_amount dari supplier_returns status REFUNDED
+            pada bulan ini (per refunded_at, TZ Asia/Jakarta). Menambah laba, bukan beban.
+            Retur uji (`supplier_returns.is_test`) dikecualikan kecuali `?include_test=true`.
+        laba_bersih: { type: number, description: 'laba_kotor + refund_distributor - total_beban_operasional' }
+        laba_netto: { type: number, description: '= laba_bersih (pajak belum dimodelkan)' }
+        ppn_diterima: { type: number }
+        total_refund: { type: number, description: 'Σ refunds ke customer pada bulan ini' }
         jml_transaksi: { type: integer }
         piutang_berjalan: { type: number }
+        note: { type: string }
+

@@ -59,13 +59,24 @@ const uuid = (): string => globalThis.crypto.randomUUID();
 async function main(): Promise<void> {
   console.log('\x1b[1m== UJI KONKURENSI MULTI-POS ==\x1b[0m');
 
-  const login = await api('POST', '/auth/login', { username: 'owner', password: 'owner123' });
-  if (login.status !== 200) throw new Error(`login gagal: ${login.status} ${JSON.stringify(login.json)}`);
-  const token: string = login.json.token;
-  console.log(`  token owner ok (id=${login.json.user.id})`);
+  // RBAC v2: mutasi = KASIR (operator), laporan = OWNER (monitor).
+  const kasir = await api('POST', '/auth/login', { username: 'kasir1', password: 'kasir123' });
+  if (kasir.status !== 200) throw new Error(`login kasir gagal: ${kasir.status} ${JSON.stringify(kasir.json)}`);
+  const token: string = kasir.json.token;
+  console.log(`  token kasir ok (id=${kasir.json.user.id})`);
+
+  // Sanity check RBAC: OWNER tidak boleh mutasi (operator = kasir).
+  const owner = await api('POST', '/auth/login', { username: 'owner', password: 'owner123' });
+  const ownerToken: string = owner.json.token;
+  const ownerMutate = await api('POST', '/products', { sku: `${TAG}-X`, name: 'UJI blocked' }, ownerToken);
+  check('OWNER POST /products -> 403 (kasir = operator)', 403, ownerMutate.status);
 
   const methods = await api('GET', '/payment-methods', undefined, token);
   const cash = methods.json.find((m: any) => m.code === 'CASH');
+
+  // Rekaman stok produk produksi (id=1) sebelum uji untuk guard regresi berbasis delta.
+  const telkomselBefore = await api('GET', '/stock?product_id=1', undefined, token);
+  const TELKOMSEL_BEFORE = telkomselBefore.json[0].qty_on_hand;
 
   /* ---------------- Skenario 1: 20 POS jual 1 unit dari stok 10 ---------------- */
   console.log('\n-- 20 request SEJAKUSAH, stok awal 10 --');
@@ -141,8 +152,10 @@ async function main(): Promise<void> {
   for (const id of [prod.json.id, prod2.json.id]) {
     await api('DELETE', `/products/${id}`, undefined, token);
   }
+  // Guard regresi berbasis delta: skrip ini tidak boleh mengubah stok produk produksi,
+  // dan toleran terhadap klien lain yang kebetulan memakai produk yang sama.
   const telkomsel = await api('GET', '/stock?product_id=1', undefined, token);
-  check('stok Telkomsel asli tetap 16', 16, telkomsel.json[0].qty_on_hand);
+  check('stok Telkomsel asli tidak berubah oleh skrip ini', TELKOMSEL_BEFORE, telkomsel.json[0].qty_on_hand);
 
   console.log(`\n  RINGKASAN KONKURENSI: PASS=${pass} FAIL=${fail}`);
   console.log(`  Sisa data uji: produk ${prod.json.id}, ${prod2.json.id} (nonaktif), 11 sale (tidak bisa dihapus).`);

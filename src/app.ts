@@ -12,8 +12,58 @@ import { rateLimit } from './middleware/rate-limit.js';
 
 const OPENAPI_PATH = path.resolve(process.cwd(), 'openapi.yaml');
 
+/**
+ * Cache spec openapi.yaml agar tidak di-parse ulang tiap request.
+ * Deteksi perubahan dengan `stat()` (murah, tanpa baca file): begitu `openapi.yaml` berubah
+ * (mtime/size), file dibaca & di-parse ulang pada request berikutnya - tidak perlu restart
+ * server setiap spec diedit. Perilaku menjaga yang lama: spec invalid -> cache lama tetap
+ * dipakai + warning (dokumentasi tidak boleh mati gara-gara salah ketik di YAML).
+ */
+let openApiCache: { doc: Record<string, unknown>; mtimeMs: number; size: number } | null = null;
+let openApiReloads = 0;
+
 function loadOpenApi(): Record<string, unknown> {
-  const file = fs.readFileSync(OPENAPI_PATH, 'utf8');
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(OPENAPI_PATH);
+  } catch (err) {
+    // File hilang/ tidak bisa di-stat: pakai cache lama kalau ada (dokumentasi tetap hidup).
+    if (openApiCache) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[openapi] GAGAL stat openapi.yaml (${err instanceof Error ? err.message : String(err)}); ` +
+          'memakai spec lama yang sudah di-cache',
+      );
+      return openApiCache.doc;
+    }
+    throw err;
+  }
+  if (openApiCache && openApiCache.mtimeMs === st.mtimeMs && openApiCache.size === st.size) {
+    return openApiCache.doc;
+  }
+  try {
+    const doc = parseOpenApi(fs.readFileSync(OPENAPI_PATH, 'utf8'));
+    openApiCache = { doc, mtimeMs: st.mtimeMs, size: st.size };
+    if (openApiReloads > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[openapi] openapi.yaml berubah -> spec dimuat ulang (mtime ${st.mtime.toISOString()})`);
+    }
+    openApiReloads += 1;
+    return doc;
+  } catch (err) {
+    if (openApiCache) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[openapi] GAGAL memuat ulang openapi.yaml (${err instanceof Error ? err.message : String(err)}); ` +
+          'memakai spec lama yang sudah di-cache',
+      );
+      return openApiCache.doc;
+    }
+    throw err;
+  }
+}
+
+function parseOpenApi(file: string): Record<string, unknown> {
   const doc = YAML.parse(file) as Record<string, unknown>;
   // Samakan base URL dengan env agar konsisten saat diakses dari host lain.
   const servers = Array.isArray(doc.servers) ? (doc.servers as Array<Record<string, unknown>>) : [];
@@ -52,9 +102,21 @@ export function createApp(): Express {
   });
 
   // Dokumentasi API langsung dari openapi.yaml (spec = sumber kebenaran).
-  const openApi = loadOpenApi();
-  app.get('/openapi.json', (_req, res) => res.json(openApi));
-  app.get('/api-docs', swaggerUi.serve, swaggerUi.setup(openApi, { customSiteTitle: 'POS Inventory API' }));
+  // Spec di-cache per mtime: /openapi.json memakai cache terbaru (mtime dicek tiap request)
+  // dan swagger UI mengambil spec lewat /openapi.json, jadi keduanya ikut ter-update
+  // begitu openapi.yaml diedit - tanpa restart server.
+  loadOpenApi(); // validasi awal: boot gagal cepat kalau spec benar-benar rusak
+  app.get('/openapi.json', (_req, res) => res.json(loadOpenApi()));
+  // CATATAN: wajib app.use (bukan app.get) — app.get hanya match path persis '/api-docs'
+  // sehingga aset statis di bawahnya (/api-docs/swagger-ui-bundle.js dst.) 404 -> halaman blank.
+  app.use(
+    '/api-docs',
+    swaggerUi.serve,
+    swaggerUi.setup(null as unknown as Record<string, unknown>, {
+      customSiteTitle: 'POS Inventory API',
+      swaggerOptions: { url: '/openapi.json' },
+    }),
+  );
 
   app.use(env.basePath, buildRouter());
 

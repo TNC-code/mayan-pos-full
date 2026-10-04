@@ -10,6 +10,7 @@ import { ApiError, type ErrorCode } from './errors.js';
 const MESSAGE_RULES: Array<{ match: RegExp; code: ErrorCode }> = [
   // --- sale_items / stok / harga ---
   { match: /stok tidak cukup/i, code: 'INSUFFICIENT_STOCK' },
+  { match: /stok rusak .* tidak cukup/i, code: 'DAMAGED_QTY_INSUFFICIENT' },
   { match: /tidak boleh di bawah harga beli/i, code: 'PRICE_BELOW_COST' },
   { match: /batch_id wajib diisi/i, code: 'BATCH_ID_REQUIRED' },
   { match: /batch .* tidak ditemukan/i, code: 'BATCH_NOT_FOUND' },

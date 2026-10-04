@@ -169,8 +169,27 @@ export const paymentCreateSchema = z.object({
   notes: z.string().trim().max(500).nullish(),
 });
 
+const conditionSchema = z.enum(['GOOD', 'RUSAK']);
+
+/**
+ * Item pengembalian barang (void / retur).
+ * - `qty` dipakai oleh refund parsial; void mengabaikan nilainya (void selalu utuh),
+ *   jadi opsional di sini karena kedua endpoint berbagi schema yang sama.
+ * - `condition` menentukan kolom stok mana yang bertambah (GOOD -> qty_remaining,
+ *   RUSAK -> qty_damaged / karantina). Default GOOD = perilaku lama.
+ */
+const returnItemSchema = z.object({
+  sale_item_id: id,
+  qty: qty.optional(),
+  condition: conditionSchema.default('GOOD'),
+});
+
 export const voidSchema = z.object({
   reason: z.string().trim().min(3, 'reason wajib diisi (minimal 3 karakter)').max(500),
+  // Opsional: tanpa items = void penuh semua item dengan kondisi GOOD.
+  items: z.array(returnItemSchema).min(1, 'minimal 1 item void').optional(),
+  // Opsional (dipakai refund): tanpa method_id = metode pembayaran terakhir.
+  method_id: id.optional(),
 });
 
 /* ------------------------------ stock ------------------------------ */
@@ -181,6 +200,14 @@ export const stockListSchema = z.object({
   active_only: boolish,
   expiring_in_days: z.coerce.number().int().min(0).max(3650).optional(),
   in_stock_only: boolish,
+  damaged_only: boolish,
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+export const damagedStockListSchema = z.object({
+  product_id: z.coerce.number().int().positive().optional(),
+  q: z.string().trim().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
   offset: z.coerce.number().int().min(0).default(0),
 });
@@ -191,11 +218,61 @@ export const movementListSchema = z.object({
   type: z.enum(['IN', 'OUT', 'ADJUSTMENT']).optional(),
   reference_type: z.string().trim().min(1).max(24).optional(),
   reference_id: z.coerce.number().int().positive().optional(),
+  condition: conditionSchema.optional(),
   limit: z.coerce.number().int().min(1).max(500).default(100),
   offset: z.coerce.number().int().min(0).default(0),
 });
 
+/* ------------------ retur distributor (UC-B) ------------------ */
+const supplierReturnItemSchema = z.object({
+  batch_id: id,
+  qty,
+  // Default = unit_cost batch (harga beli saat barang masuk).
+  unit_cost: money.nullish(),
+});
+
+export const supplierReturnCreateSchema = z.object({
+  supplier_name: z.string().trim().min(1, 'supplier_name wajib diisi').max(200),
+  items: z.array(supplierReturnItemSchema).min(1, 'minimal 1 item retur'),
+  note: z.string().trim().max(500).nullish(),
+  // Tanda data uji (default false = retur produksi). Dikecualikan dari `refund_distributor`
+  // di P&L; `?include_test=true` memunculkan lagi nilainya.
+  is_test: z.boolean().nullish(),
+});
+
+/**
+ * Settle retur distributor: discriminated union dua hasil yang TIDAK boleh tertukar.
+ *  - REFUNDED   -> wajib `amount` (+ method_id bila mau dicatat lewat kanal pembayaran)
+ *  - WRITTEN_OFF-> otomatis jadi opex BARANG_RUSAK, tanpa nominal
+ */
+export const supplierReturnSettleSchema = z.discriminatedUnion('result', [
+  z.object({
+    result: z.literal('REFUNDED'),
+    amount: money.positive('amount refund distributor harus lebih besar dari 0'),
+    method_id: id.nullish(),
+    reference_no: z.string().trim().max(100).nullish(),
+    note: z.string().trim().max(500).nullish(),
+  }),
+  z.object({
+    result: z.literal('WRITTEN_OFF'),
+    note: z.string().trim().max(500).nullish(),
+  }),
+]);
+
+export const supplierReturnListSchema = z.object({
+  status: z.enum(['PENDING', 'REFUNDED', 'WRITTEN_OFF']).optional(),
+  supplier_name: z.string().trim().min(1).max(200).optional(),
+  date_from: dateStr.optional(),
+  date_to: dateStr.optional(),
+  q: z.string().trim().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
 /* ----------------------------- opnames ----------------------------- */
+/** Penyebab selisih opname (wajib diisi kalau kasir tahu penyebabnya). */
+const opnameCauseSchema = z.enum(['RUSAK', 'HILANG', 'SALAH_HITUNG', 'LAIN']);
+
 export const opnameCreateSchema = z.object({
   note: z.string().trim().max(500).nullish(),
   items: z
@@ -203,6 +280,10 @@ export const opnameCreateSchema = z.object({
       z.object({
         product_id: id,
         physical_qty: z.coerce.number().min(0, 'physical_qty tidak boleh negatif'),
+        // Jumlah fisik barang RUSAK. Tidak diisi = dianggap sama dengan sistem
+        // (tidak ada adjustment barang rusak; kolomnya diisi nilai sistem).
+        physical_qty_damaged: z.coerce.number().min(0, 'physical_qty_damaged tidak boleh negatif').nullish(),
+        cause: opnameCauseSchema.nullish(),
         batch_id: z.coerce.number().int().positive().nullish(),
         note: z.string().trim().max(500).nullish(),
       }),
@@ -237,12 +318,22 @@ export const expenseUpdateSchema = expenseCreateSchema.partial().refine((v) => O
 export const expenseListSchema = z.object({
   month: z.string().regex(/^\d{4}-\d{2}$/, 'format month harus YYYY-MM').optional(),
   category: z.string().trim().min(1).max(50).optional(),
+  // Opex dari skrip uji disembunyikan secara default (padanan sales.include_test).
+  include_test: boolish,
   limit: z.coerce.number().int().min(1).max(200).default(50),
   offset: z.coerce.number().int().min(0).default(0),
 });
 
 /* ------------------------------ reports ------------------------------ */
 export const pnlQuerySchema = z.object({
+  month: z.string().regex(/^\d{4}-\d{2}$/, 'format month harus YYYY-MM'),
+  // Data uji (sales / opex / retur distributor) dikecualikan default; OWNER boleh melihat
+  // semuanya sekaligus (padanan GET /expenses?include_test).
+  include_test: boolish,
+});
+
+/** Laporan analisa opname bulanan (OWNER). */
+export const opnameReportQuerySchema = z.object({
   month: z.string().regex(/^\d{4}-\d{2}$/, 'format month harus YYYY-MM'),
 });
 

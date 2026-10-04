@@ -32,9 +32,10 @@ hr "FASE 0 - auth"
 step "a) login owner"
 CODE=$(curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$API/auth/login" -H 'Content-Type: application/json' -d '{"username":"owner","password":"owner123"}')
 check "a1 login owner 200" 200 "$CODE" "$(body)"
-TOKEN=$(jqv token < /tmp/r.json)
+OWNER_TOKEN=$(jqv token < /tmp/r.json)
+TOKEN=$OWNER_TOKEN
 check "a2 role OWNER" "OWNER" "$(jqv role < /tmp/r.json)"
-[[ -n "$TOKEN" ]] && ok "a3 token ada" "${TOKEN:0:25}..." || bad "a3 token ada" "kosong"
+[[ -n "$OWNER_TOKEN" ]] && ok "a3 token ada" "${OWNER_TOKEN:0:25}..." || bad "a3 token ada" "kosong"
 
 step "a) login kasir + proteksi endpoint"
 CODE=$(curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$API/auth/login" -H 'Content-Type: application/json' -d '{"username":"kasir1","password":"kasir123"}')
@@ -46,6 +47,22 @@ SAVED=$TOKEN; TOKEN="buruk"; CODE=$(get "$API/products"); check "a7 token salah 
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/products"); check "a8 tanpa token -> 401" 401 "$CODE"
 CODE=$(curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$API/auth/login" -H 'Content-Type: application/json' -d '{"username":"owner","password":"salah"}')
 check "a9 password salah -> 401" 401 "$CODE"
+CODE=$(get "$API/auth/me"); check "a10 auth/me kasir 200" 200 "$CODE"
+SAVED=$TOKEN; TOKEN=$KASIR_TOKEN
+CODE=$(get "$API/auth/me"); check "a10b auth/me kasir 200" 200 "$CODE"
+check "a11 auth/me role KASIR" "KASIR" "$(jqv user.role < /tmp/r.json)"
+TOKEN=$OWNER_TOKEN
+CODE=$(get "$API/auth/me"); check "a12 auth/me owner 200" 200 "$CODE"
+check "a13 auth/me role OWNER" "OWNER" "$(jqv user.role < /tmp/r.json)"
+TOKEN=$SAVED
+
+# RBAC v2: semua mutasi = KASIR (operator), semua laporan = OWNER (monitor).
+# Mulai fase kerja, token default diganti ke kasir.
+TOKEN=$KASIR_TOKEN
+
+# Rekaman stok produk produksi (id=1) SEBELUM uji, untuk cek regresi berbasis delta
+# (toleran bila ada klien lain yang kebetulan memakai produk yang sama).
+P1_BEFORE=$(get "$API/stock?product_id=1" >/dev/null; jqv 0.qty_on_hand < /tmp/r.json)
 
 hr "FASE 1 - master data"
 step "b) buat produk gula 1kg"
@@ -71,15 +88,16 @@ BANK_ID=$(node -e "const a=JSON.parse(require('fs').readFileSync('/tmp/r.json'))
 # code unik per run supaya skrip bisa diulang berkali-kali
 MCODE="M$RUN_TAG"
 CODE=$(post "$API/payment-methods" "{\"code\":\"$MCODE\",\"name\":\"TEST E-Wallet $RUN_TAG\",\"requires_reference\":true}")
-check "b8 owner create method 201" 201 "$CODE" "$(body)"
+check "b8 kasir create method 201" 201 "$CODE" "$(body)"
 EWALLET_ID=$(jqv id < /tmp/r.json)
-CODE=$(post "$API/payment-methods" "{\"code\":\"EWALLET\",\"name\":\"duplikat\"}")
+CODE=$(post "$API/payment-methods" '{"code":"EWALLET","name":"duplikat"}')
 if [[ "$CODE" == "409" ]]; then ok "b9 kode metode unik -> 409" "$(jqv code < /tmp/r.json)"; else bad "b9 kode metode unik -> 409" "aktual=$CODE $(body)"; fi
 CODE=$(post "$API/payment-methods" '{"code":"kode nakal!","name":"invalid"}'); check "b9b kode format salah -> 400" 400 "$CODE" "$(body)"
-SAVED=$TOKEN; TOKEN=$KASIR_TOKEN
-CODE=$(post "$API/payment-methods" '{"code":"OTHER","name":"TEST Other"}'); check "b10 kasir create method -> 403" 403 "$CODE" "$(body)"
-CODE=$(get "$API/payment-methods"); check "b11 kasir boleh list method 200" 200 "$CODE"
+# RBAC v2: input metode bayar = kasir; OWNER read-only -> 403.
+SAVED=$TOKEN; TOKEN=$OWNER_TOKEN
+CODE=$(post "$API/payment-methods" '{"code":"OTHER","name":"TEST Other"}'); check "b10 owner create method -> 403" 403 "$CODE" "$(body)"
 TOKEN=$SAVED
+CODE=$(get "$API/payment-methods"); check "b11 kasir boleh list method 200" 200 "$CODE"
 
 hr "FASE 2 - pembelian (barang masuk)"
 step "b) purchase 10 kg gula @10000"
@@ -243,8 +261,8 @@ CODE=$(get "$API/products/999999"); check "x4 produk tidak ada -> 404" 404 "$COD
 CODE=$(get "$API/stock?expiring_in_days=30"); check "x5 filter expiring 200" 200 "$CODE"
 CODE=$(get "$API/categories"); check "x6 list kategori 200" 200 "$CODE"
 CODE=$(get "$API/customers"); check "x7 list customer 200" 200 "$CODE"
-CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/openapi.json); check "x8 /openapi.json 200" 200 "$CODE"
-CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api-docs/); check "x9 /api-docs 200" 200 "$CODE"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${API%/api/v1}/openapi.json"); check "x8 /openapi.json 200" 200 "$CODE"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${API%/api/v1}/api-docs/"); check "x9 /api-docs 200" 200 "$CODE"
 
 step "validasi body (tidak menyentuh data asli)"
 CODE=$(post "$API/sales" '{"items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")")
@@ -252,21 +270,268 @@ check "x10 items kosong -> 400" 400 "$CODE" "$(body)"
 CODE=$(post "$API/purchases" "{\"product_id\":1,\"qty\":-5,\"unit_cost\":1}")
 check "x11 qty negatif -> 400" 400 "$CODE" "$(body)"
 
+# ============================================================
+#                  BACKEND v2 - UC A / C / D / B
+#   Sequencing (penting, stok & rusak dipakai bersama):
+#     UC-A  refund parsial RUSAK  -> damaged gula = 1
+#     UC-C  void condition campuran-> damaged gula = 3 (total)
+#     UC-D  opname detail (good -0.5, damaged -1) -> damaged gula = 2
+#     UC-B  retur distributor x2 (REFUNDED lalu WRITTEN_OFF) -> damaged = 0
+# ============================================================
+
+hr "UC-A - refund parsial barang rusak (nota PAID)"
+step "A) jual 3 kg gula @15000, CASH lunas"
+KEY_A0=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales" "{\"note\":\"UC-A\",\"items\":[{\"product_id\":$GULA_ID,\"qty\":3,\"unit_price\":15000}],\"payment\":{\"method_id\":$CASH_ID,\"amount\":45000,\"tendered_amount\":45000}}" "$KEY_A0")
+check "A1 create sale PAID 201" 201 "$CODE" "$(body)"
+SALE_A=$(jqv id < /tmp/r.json); ITEM_A=$(jqv items.0.id < /tmp/r.json)
+CODE=$(get "$API/stock?product_id=$GULA_ID"); check "A2 stok 6.5" "6.5" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+
+step "A) refund 1 pcs RUSAK (uang kembali 15000, kartu masuk karantina)"
+KEY_A1=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales/$SALE_A/refund" "{\"reason\":\"kartu rusak\",\"items\":[{\"sale_item_id\":$ITEM_A,\"qty\":1,\"condition\":\"RUSAK\"}]}" "$KEY_A1")
+check "A3 refund parsial 200" 200 "$CODE" "$(body)"
+check "A4 refunded_amount 15000" "15000" "$(jqv refunded_amount < /tmp/r.json)"
+check "A5 status masih COMPLETED (parsial)" "COMPLETED" "$(jqv status < /tmp/r.json)"
+check "A6 refund_items condition RUSAK" "RUSAK" "$(jqv refund_items.0.condition < /tmp/r.json)"
+check "A7 refund_items qty 1" "1" "$(jqv refund_items.0.qty < /tmp/r.json)"
+check "A8 refund_items subtotal 15000" "15000" "$(jqv refund_items.0.subtotal < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$GULA_ID")
+check "A9 qty_on_hand 6.5 (RUSAK TIDAK masuk stok jual)" "6.5" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+check "A10 qty_damaged 1 (karantina)" "1" "$(jqv 0.qty_damaged < /tmp/r.json)"
+CODE=$(get "$API/stock/movements?product_id=$GULA_ID&reference_type=RETURN&condition=RUSAK")
+check "A11 movement IN RUSAK tercatat" 200 "$CODE"
+check "A12 qty_change +1 condition RUSAK" "1" "$(jqv 0.qty_change < /tmp/r.json)"
+contains "A13 note movement menandai rusak" "rusak" "$(jqv 0.note < /tmp/r.json)"
+
+step "A) refund melebihi sisa qty -> 422 REFUND_QTY_EXCEEDED"
+KEY_A2=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales/$SALE_A/refund" "{\"reason\":\"minta kelebihan\",\"items\":[{\"sale_item_id\":$ITEM_A,\"qty\":5,\"condition\":\"GOOD\"}]}" "$KEY_A2")
+check "A14 refund melebihi sisa -> 422" 422 "$CODE" "$(body)"
+contains "A15 code REFUND_QTY_EXCEEDED" "REFUND_QTY_EXCEEDED" "$(jqv code < /tmp/r.json)"
+
+step "A) refund penuh (tanpa items) -> sisa 30000, status RETURNED"
+KEY_A3=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales/$SALE_A/refund" '{"reason":"sisa retur dalam kondisi baik"}' "$KEY_A3")
+check "A16 refund penuh 200" 200 "$CODE" "$(body)"
+check "A17 refunded_amount 45000 (15000 + 30000)" "45000" "$(jqv refunded_amount < /tmp/r.json)"
+check "A18 status RETURNED" "RETURNED" "$(jqv status < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$GULA_ID")
+check "A19 qty_on_hand 8.5 (2 GOOD balik ke stok jual)" "8.5" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+check "A20 qty_damaged tetap 1" "1" "$(jqv 0.qty_damaged < /tmp/r.json)"
+
+hr "UC-C - void dengan condition campuran"
+step "C) jual 2 gula + 1 voucher TANPA payment (UNPAID)"
+KEY_C2=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales" "{\"note\":\"UC-C\",\"items\":[{\"product_id\":$GULA_ID,\"qty\":2,\"unit_price\":15000},{\"product_id\":$VOUCHER_ID,\"qty\":1,\"unit_price\":50000}]}" "$KEY_C2")
+check "C1 create sale UNPAID 201" 201 "$CODE" "$(body)"
+SALE_C2=$(jqv id < /tmp/r.json)
+IT_C1=$(jqv items.0.id < /tmp/r.json); IT_C2=$(jqv items.1.id < /tmp/r.json)
+CODE=$(get "$API/stock?product_id=$VOUCHER_ID"); check "C2 stok voucher 1" "1" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+
+step "C) void: gula RUSAK + voucher GOOD (label & kolom stok harus berbeda)"
+CODE=$(post "$API/sales/$SALE_C2/void" "{\"reason\":\"barang rusak saat terima\",\"items\":[{\"sale_item_id\":$IT_C1,\"condition\":\"RUSAK\"},{\"sale_item_id\":$IT_C2,\"condition\":\"GOOD\"}]}")
+check "C3 void berlabel 200" 200 "$CODE" "$(body)"
+check "C4 status VOIDED" "VOIDED" "$(jqv status < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$GULA_ID")
+check "C5 qty_on_hand 6.5 (2 RUSAK -> karantina)" "6.5" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+check "C6 qty_damaged 3" "3" "$(jqv 0.qty_damaged < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$VOUCHER_ID")
+check "C7 stok voucher balik 2 (1 GOOD)" "2" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+check "C8 qty_damaged voucher 0" "0" "$(jqv 0.qty_damaged < /tmp/r.json)"
+CODE=$(get "$API/stock/movements?product_id=$GULA_ID&reference_type=VOID&condition=RUSAK&reference_id=$SALE_C2")
+check "C9 movement VOID RUSAK ada" 200 "$CODE"
+check "C10 1 movement RUSAK" "1" "$(jlen)"
+check "C11 qty_change +2 condition RUSAK" "2" "$(jqv 0.qty_change < /tmp/r.json)"
+contains "C12 label note barang rusak" "rusak" "$(jqv 0.note < /tmp/r.json)"
+CODE=$(get "$API/stock/movements?product_id=$VOUCHER_ID&reference_type=VOID&condition=GOOD&reference_id=$SALE_C2")
+check "C13 movement VOID GOOD voucher ada" 200 "$CODE"
+check "C14 qty_change +1 condition GOOD" "1" "$(jqv 0.qty_change < /tmp/r.json)"
+check "C15 label note barang baik" "Void penjualan" "$(jqv 0.note < /tmp/r.json)"
+
+hr "UC-D - opname detail (selisih GOOD + RUSAK, cause, nilai Rp)"
+step "D) opname gula: fisik 6 (sistem 6.5) + rusak fisik 2 (sistem 3)"
+CODE=$(get "$API/stock?product_id=$GULA_ID")
+check "D1 sistem GOOD 6.5" "6.5" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+check "D2 sistem RUSAK 3" "3" "$(jqv 0.qty_damaged < /tmp/r.json)"
+CODE=$(post "$API/opnames" "{\"note\":\"UC-D opname detail\",\"items\":[{\"product_id\":$GULA_ID,\"physical_qty\":6,\"physical_qty_damaged\":2,\"cause\":\"RUSAK\"}]}")
+check "D3 opname detail 201" 201 "$CODE" "$(body)"
+OPNAME_D=$(jqv id < /tmp/r.json)
+check "D4 system_qty 6.5" "6.5" "$(jqv items.0.system_qty < /tmp/r.json)"
+check "D5 difference -0.5" "-0.5" "$(jqv items.0.difference < /tmp/r.json)"
+check "D6 system_qty_damaged 3" "3" "$(jqv items.0.system_qty_damaged < /tmp/r.json)"
+check "D7 physical_qty_damaged 2" "2" "$(jqv items.0.physical_qty_damaged < /tmp/r.json)"
+check "D8 damaged_difference -1" "-1" "$(jqv items.0.damaged_difference < /tmp/r.json)"
+check "D9 cause RUSAK" "RUSAK" "$(jqv items.0.cause < /tmp/r.json)"
+check "D10 unit_cost 10000" "10000" "$(jqv items.0.unit_cost < /tmp/r.json)"
+check "D11 value_difference -5000" "-5000" "$(jqv items.0.value_difference < /tmp/r.json)"
+check "D12 value_difference_damaged -10000" "-10000" "$(jqv items.0.value_difference_damaged < /tmp/r.json)"
+check "D13 value_difference_total -15000" "-15000" "$(jqv items.0.value_difference_total < /tmp/r.json)"
+check "D14 header total_value_difference -15000" "-15000" "$(jqv total_value_difference < /tmp/r.json)"
+check "D15 header total_loss_value 15000" "15000" "$(jqv total_loss_value < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$GULA_ID")
+check "D16 stok terkoreksi 6" "6" "$(jqv 0.qty_on_hand < /tmp/r.json)"
+check "D17 rusak terkoreksi 2" "2" "$(jqv 0.qty_damaged < /tmp/r.json)"
+CODE=$(get "$API/stock/movements?product_id=$GULA_ID&type=ADJUSTMENT&condition=RUSAK&reference_id=$OPNAME_D")
+check "D18 movement ADJUSTMENT RUSAK opname ini" 200 "$CODE"
+check "D19 tepat 1 movement RUSAK" "1" "$(jlen)"
+check "D20 qty_change -1 (barang rusak berkurang)" "-1" "$(jqv 0.qty_change < /tmp/r.json)"
+CODE=$(get "$API/stock/movements?product_id=$GULA_ID&type=ADJUSTMENT&condition=GOOD&reference_id=$OPNAME_D")
+check "D21 movement ADJUSTMENT GOOD opname ini" 200 "$CODE"
+check "D22 qty_change -0.5" "-0.5" "$(jqv 0.qty_change < /tmp/r.json)"
+CODE=$(get "$API/opnames/$OPNAME_D"); check "D23 detail opname 200" 200 "$CODE"
+check "D24 detail kembali value_difference -15000" "-15000" "$(jqv total_value_difference < /tmp/r.json)"
+check "D25 detail kembali cause RUSAK" "RUSAK" "$(jqv items.0.cause < /tmp/r.json)"
+
+hr "UC-B - retur distributor (settle REFUNDED & WRITTEN_OFF)"
+step "B) daftar stok rusak siap diretur"
+CODE=$(get "$API/stock/damaged?product_id=$GULA_ID"); check "B1 /stock/damaged 200" 200 "$CODE"
+check "B2 batch tercantum" "$GULA_BATCH" "$(jqv 0.batch_id < /tmp/r.json)"
+check "B3 qty_damaged 2" "2" "$(jqv 0.qty_damaged < /tmp/r.json)"
+
+step "B) buat retur #1 dari 1 pcs rusak -> PENDING, qty_damaged berkurang"
+KEY_B1=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/supplier-returns" "{\"supplier_name\":\"TEST-Distributor $RUN_TAG\",\"items\":[{\"batch_id\":$GULA_BATCH,\"qty\":1}]}" "$KEY_B1")
+check "B4 create retur 201" 201 "$CODE" "$(body)"
+SR1=$(jqv id < /tmp/r.json)
+contains "B5 return_no RTR-YYYYMMDD-NNN" "RTR-" "$(jqv return_no < /tmp/r.json)"
+check "B6 status PENDING" "PENDING" "$(jqv status < /tmp/r.json)"
+check "B7 total_cost 10000" "10000" "$(jqv total_cost < /tmp/r.json)"
+check "B8 item condition RUSAK" "RUSAK" "$(jqv items.0.condition < /tmp/r.json)"
+# supplier_name berprefiks TEST- supaya 'mark-test-data' bisa menandai retur uji secara deterministik.
+contains "B8b supplier_name prefiks TEST- (determinisme mark-test-data)" "TEST-" "$(jqv supplier_name < /tmp/r.json)"
+# Default retur = produksi (is_test false) -> baru ditandai mark-test-data di akhir skrip.
+check "B8c is_test default false" "false" "$(jqv is_test < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$GULA_ID")
+check "B9 qty_damaged 1" "1" "$(jqv 0.qty_damaged < /tmp/r.json)"
+CODE=$(get "$API/stock/movements?product_id=$GULA_ID&reference_type=SUPPLIER_RETURN")
+check "B10 movement OUT SUPPLIER_RETURN" 200 "$CODE"
+check "B11 qty_change -1 condition RUSAK" "-1" "$(jqv 0.qty_change < /tmp/r.json)"
+CODE=$(get "$API/supplier-returns"); check "B12 list retur 200" 200 "$CODE"
+
+step "B) retur melebihi stok rusak -> 409 DAMAGED_QTY_INSUFFICIENT"
+KEY_B2=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/supplier-returns" "{\"supplier_name\":\"TEST-Distributor $RUN_TAG\",\"items\":[{\"batch_id\":$GULA_BATCH,\"qty\":99}]}" "$KEY_B2")
+check "B13 retur melebihi rusak -> 409" 409 "$CODE" "$(body)"
+contains "B14 code DAMAGED_QTY_INSUFFICIENT" "DAMAGED_QTY_INSUFFICIENT" "$(jqv code < /tmp/r.json)"
+
+step "B) settle REFUNDED (distributor bayar balik 10000)"
+KEY_B3=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/supplier-returns/$SR1/settle" "{\"result\":\"REFUNDED\",\"amount\":10000,\"method_id\":$CASH_ID,\"reference_no\":\"TEST-TRF-B1\",\"note\":\"uang masuk dari distributor\"}" "$KEY_B3")
+check "B15 settle REFUNDED 200" 200 "$CODE" "$(body)"
+check "B16 status REFUNDED" "REFUNDED" "$(jqv status < /tmp/r.json)"
+check "B17 refunded_amount 10000" "10000" "$(jqv refunded_amount < /tmp/r.json)"
+[[ -n "$(jqv refunded_at < /tmp/r.json)" ]] && ok "B18 refunded_at terisi" "$(jqv refunded_at < /tmp/r.json)" || bad "B18 refunded_at terisi" "kosong"
+check "B19 write_off_expense null" "" "$(jqv write_off_expense < /tmp/r.json)"
+
+step "B) settle kedua -> 409 SUPPLIER_RETURN_SETTLED"
+KEY_B4=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/supplier-returns/$SR1/settle" '{"result":"WRITTEN_OFF"}' "$KEY_B4")
+check "B20 settle ulang -> 409" 409 "$CODE" "$(body)"
+contains "B21 code SUPPLIER_RETURN_SETTLED" "SUPPLIER_RETURN_SETTLED" "$(jqv code < /tmp/r.json)"
+
+step "B) retur #2 -> WRITTEN_OFF = opex BARANG_RUSAK otomatis"
+KEY_B5=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/supplier-returns" "{\"supplier_name\":\"TEST-Distributor $RUN_TAG\",\"items\":[{\"batch_id\":$GULA_BATCH,\"qty\":1}]}" "$KEY_B5")
+check "B22 create retur #2 201" 201 "$CODE" "$(body)"
+SR2=$(jqv id < /tmp/r.json)
+KEY_B6=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/supplier-returns/$SR2/settle" '{"result":"WRITTEN_OFF","note":"distributor menolak barang"}' "$KEY_B6")
+check "B23 settle WRITTEN_OFF 200" 200 "$CODE" "$(body)"
+check "B24 status WRITTEN_OFF" "WRITTEN_OFF" "$(jqv status < /tmp/r.json)"
+check "B25 opex otomatis dibuat" "true" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(!!JSON.parse(s).write_off_expense))" < /tmp/r.json)"
+check "B26 opex kategori BARANG_RUSAK" "BARANG_RUSAK" "$(jqv write_off_expense.category < /tmp/r.json)"
+check "B27 opex amount = total_cost" "10000" "$(jqv write_off_expense.amount < /tmp/r.json)"
+check "B28 opex source SUPPLIER_RETURN" "SUPPLIER_RETURN" "$(jqv write_off_expense.source < /tmp/r.json)"
+check "B29 opex ter-link ke retur" "$SR2" "$(jqv write_off_expense.supplier_return_id < /tmp/r.json)"
+# Opex write-off mewarisi tanda retur (T9): retur produksi -> opex produksi.
+check "B29b opex write-off mewarisi is_test retur" "false" "$(jqv write_off_expense.is_test < /tmp/r.json)"
+CODE=$(get "$API/stock?product_id=$GULA_ID"); check "B30 qty_damaged habis (0)" "0" "$(jqv 0.qty_damaged < /tmp/r.json)"
+
+hr "P&L & laporan (OWNER only)"
+MONTH=$(TZ=Asia/Jakarta date +%Y-%m)
+SAVED=$TOKEN; TOKEN=$OWNER_TOKEN
+CODE=$(get "$API/reports/pnl?month=$MONTH"); check "P1 P&L OWNER 200" 200 "$CODE"
+check "P2 refund_distributor muncul" "true" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(typeof JSON.parse(s).refund_distributor==='number'))" < /tmp/r.json)"
+P_REFUND_DIST=$(jqv refund_distributor < /tmp/r.json)
+[[ "$P_REFUND_DIST" -gt 0 ]] && ok "P3 refund_distributor > 0 (= retur distributor REFUNDED bulan ini)" "$P_REFUND_DIST" || bad "P3 refund_distributor > 0" "aktual=$P_REFUND_DIST"
+contains "P4 catatan P&L memuat refund_distributor" "refund_distributor" "$(jqv note < /tmp/r.json)"
+# T9: retur uji punya supplier_returns.is_test -> default dikecualikan, include_test=true memunculkan.
+CODE=$(get "$API/reports/pnl?month=$MONTH&include_test=true"); check "P3b P&L include_test=true 200" 200 "$CODE"
+P_REFUND_DIST_ALL=$(jqv refund_distributor < /tmp/r.json)
+[[ "$P_REFUND_DIST_ALL" -ge "$P_REFUND_DIST" ]] && ok "P3c refund_distributor(include_test) >= default" "$P_REFUND_DIST_ALL >= $P_REFUND_DIST" || bad "P3c refund_distributor(include_test) >= default" "include=$P_REFUND_DIST_ALL default=$P_REFUND_DIST"
+contains "P3d catatan P&L mode include_test" "include_test=true" "$(jqv note < /tmp/r.json)"
+CODE=$(get "$API/reports/opname?month=$MONTH"); check "P5 /reports/opname OWNER 200" 200 "$CODE"
+OP_ITEMS=$(jqv total.item_count < /tmp/r.json)
+[[ "$OP_ITEMS" -ge 1 ]] && ok "P6 laporan opname punya item" "$OP_ITEMS" || bad "P6 laporan opname punya item" "aktual=$OP_ITEMS"
+contains "P7 opname report ada kolom stok rusak" "stok_rusak_belum_diretur" "$(body)"
+TOKEN=$SAVED
+
+hr "Matriks RBAC (KASIR = operator, OWNER = monitor)"
+SAVED=$TOKEN; TOKEN=$KASIR_TOKEN
+for P in "/reports/pnl?month=$MONTH" "/reports/dashboard" "/reports/opname?month=$MONTH" "/expenses"; do
+  CODE=$(get "$API$P"); check "R1 kasir $P -> 403" 403 "$CODE"
+done
+CODE=$(get "$API/expenses/5"); check "R2 kasir /expenses/{id} -> 403" 403 "$CODE"
+TOKEN=$SAVED
+CODE=$(post "$API/expenses" '{"category":"TEST_RBAC","amount":1000}')
+check "R3 kasir POST /expenses 201 (boleh input opex)" 201 "$CODE" "$(body)"
+OPEX_RBAC=$(jqv id < /tmp/r.json)
+CODE=$(post "$API/products" "{\"sku\":\"TEST-RBAC-$RUN_TAG\",\"name\":\"TEST RBAC operator\"}")
+check "R4 kasir POST /products 201 (boleh input master)" 201 "$CODE" "$(body)"
+PROD_RBAC=$(jqv id < /tmp/r.json)
+TOKEN=$OWNER_TOKEN
+CODE=$(post "$API/products" "{\"sku\":\"TEST-RBACO-$RUN_TAG\",\"name\":\"TEST RBAC owner\"}"); check "R5 owner POST /products -> 403" 403 "$CODE" "$(body)"
+CODE=$(post "$API/expenses" '{"category":"TEST_RBAC_O","amount":1000}'); check "R6 owner POST /expenses -> 403" 403 "$CODE"
+CODE=$(post "$API/purchases" '{"product_id":1,"qty":1,"unit_cost":1}'); check "R7 owner POST /purchases -> 403" 403 "$CODE"
+CODE=$(post "$API/sales" '{"items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")"); check "R8 owner POST /sales -> 403" 403 "$CODE"
+CODE=$(post "$API/opnames" '{"items":[]}'); check "R9 owner POST /opnames -> 403" 403 "$CODE"
+CODE=$(post "$API/supplier-returns" '{"supplier_name":"X","items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")"); check "R10 owner POST /supplier-returns -> 403" 403 "$CODE"
+CODE=$(patch "$API/store" '{"name":"x"}'); check "R11 owner PATCH /store -> 403" 403 "$CODE"
+CODE=$(get "$API/reports/pnl?month=$MONTH"); check "R12 owner laporan P&L tetap 200" 200 "$CODE"
+CODE=$(get "$API/expenses"); check "R13 owner GET /expenses 200" 200 "$CODE"
+CODE=$(get "$API/products"); check "R14 owner GET /products 200 (tetap baca)" 200 "$CODE"
+CODE=$(get "$API/auth/me"); check "R15 owner auth/me 200" 200 "$CODE"
+TOKEN=$KASIR_TOKEN
+CODE=$(get "$API/auth/me"); check "R16 kasir auth/me 200" 200 "$CODE"
+CODE=$(get "$API/sales"); check "R17 kasir GET /sales 200 (semua role boleh baca)" 200 "$CODE"
+CODE=$(get "$API/stock/damaged"); check "R18 kasir GET /stock/damaged 200" 200 "$CODE"
+
 hr "Pembersihan data uji"
 step "nonaktifkan produk uji (soft delete) + nonaktifkan metode uji"
-for PID in $GULA_ID $VOUCHER_ID; do
+for PID in $GULA_ID $VOUCHER_ID $PROD_RBAC; do
   CODE=$(curl -s -o /tmp/r.json -w '%{http_code}' -X DELETE "$API/products/$PID" -H "Authorization: Bearer $TOKEN")
   check "c1x produk $PID nonaktif" 200 "$CODE" "$(body)"
 done
 CODE=$(patch "$API/payment-methods/$EWALLET_ID" '{"is_active":false,"notes":"nonaktif setelah uji e2e"}')
 check "c2x metode uji nonaktif" 200 "$CODE" "$(body)"
 
-step "verifikasi data asli tidak berubah (kartu Telkomsel id=1 harus tetap 16)"
-CODE=$(get "$API/stock?product_id=1"); check "c3x stok Telkomsel tetap 16" "16" "$(jqv 0.qty_on_hand < /tmp/r.json)"
-CODE=$(get "$API/purchases?product_id=1"); check "c4x batch Telkomsel tetap 20/16" "16" "$(jqv 0.qty_remaining < /tmp/r.json)"
+step "tandai opex uji (R3) supaya tidak masuk P&L produksi"
+TOKEN=$OWNER_TOKEN
+CODE=$(get "$API/expenses/$OPEX_RBAC"); check "c5x detail opex uji (OWNER) 200" 200 "$CODE"
+TOKEN=$KASIR_TOKEN
+
+step "verifikasi data asli tidak berubah oleh e2e ini (produk produksi id=1)"
+# Delta-based: skrip ini tidak boleh mengubah stok produk produksi. Angka absolut bisa
+# berubah kalau ada klien lain (mis. POS sungguhan) memakai produk yang sama.
+CODE=$(get "$API/stock?product_id=1"); P1_AFTER=$(jqv 0.qty_on_hand < /tmp/r.json)
+check "c3x stok produk id=1 tidak berubah oleh e2e" "$P1_BEFORE" "$P1_AFTER" "sebelum=$P1_BEFORE sesudah=$P1_AFTER"
+# Batch GRN-20261004-001 searched by code (bukan index 0) supaya tahan batch lain.
+CODE=$(get "$API/purchases?product_id=1")
+B1_AFTER=$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const a=JSON.parse(s).filter(x=>x.batch_code==='GRN-20261004-001');console.log(a.length?a[0].qty_remaining:'tidak-ada')})" < /tmp/r.json)
+[[ -n "$B1_AFTER" && "$B1_AFTER" != "tidak-ada" ]] && ok "c4x batch GRN-20261004-001 masih ada" "qty_remaining=$B1_AFTER" || bad "c4x batch GRN-20261004-001" "tidak ditemukan"
+
+step "jalankan mark-test-data (tandai sale + opex uji agar tidak masuk laporan)"
+if command -v npx >/dev/null 2>&1 && [[ -f scripts/mark-test-data.ts ]]; then
+  MARK_OUT=$(npx tsx scripts/mark-test-data.ts 2>&1 | grep -v 'injected env')
+  printf '%s\n' "$MARK_OUT" | sed 's/^/    /'
+  if printf '%s' "$MARK_OUT" | grep -q 'GAGAL'; then bad "c6x mark-test-data" "gagal"; else ok "c6x mark-test-data jalan" "$(printf '%s' "$MARK_OUT" | grep -c 'is_test=true' >/dev/null && echo ok)"; fi
+else
+  bad "c6x mark-test-data" "npx atau skrip tidak ditemukan (cwd=$(pwd))"
+fi
 
 hr "RINGKASAN"
 printf '  PASS: %d   FAIL: %d\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then printf '\n  Gagal:\n'; for f in "${FAILED[@]}"; do printf '   - %s\n' "$f"; done; exit 1; fi
 printf '\n  Semua uji lulus.\n'
-printf '  Data uji tersisa: produk id=%s,%s (nonaktif), sale id=%s,%s,%s,%s (tidak bisa di-DELETE).\n' "$GULA_ID" "$VOUCHER_ID" "$SALE_C" "$SALE_D" "$SALE_V" "$ID1"
+printf '  Data uji tersisa: produk id=%s,%s,%s (nonaktif), sale id=%s,%s,%s,%s,%s,%s (tidak bisa di-DELETE).\n' "$GULA_ID" "$VOUCHER_ID" "$PROD_RBAC" "$SALE_C" "$SALE_D" "$SALE_V" "$ID1" "$SALE_A" "$SALE_C2"

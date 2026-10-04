@@ -4,13 +4,14 @@ node_modules/
 # build output
 dist/
 *.tsbuildinfo
-
+fe/*
 # environment & secrets (JANGAN commit)
 .env
 .env.*
 !.env.example
 
 # backup database
+scripts/*
 backups/
 *.dump
 

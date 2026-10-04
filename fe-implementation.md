@@ -1,5 +1,9 @@
 # Frontend Implementation Plan — POS Inventory
 
+> ⚠️ **TERGANTIKAN (sebagian)** — Tech stack React di dokumen ini sudah tidak dipakai.
+> FE sekarang: **Flutter tablet** → lihat `fe/plan-fe-flutter-tablet.md` (termasuk RBAC final v2: kasir=operator, owner=laporan saja).
+> Bagian yang TETAP relevan di sini sebagai referensi: §2 (aturan API client/idempotency), §4b (konsep ledger), §5 (layout struk), §7 (ke concerns multi-POS).
+
 > Backend: API only (36 paths, OpenAPI 3.0 — `openapi.yaml`, Swagger UI `/api-docs`)
 > Target: aplikasi kasir + panel owner, **2 terminal POS / multi-user**, receipt printing
 > Dokumen ini = rencana implementasi FE; tidak ada logic bisnis di FE (semua dijaga DB via trigger).
