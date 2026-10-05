@@ -1,20 +1,22 @@
 # Menu Matrix — OWNER vs KASIR
 
 > Sumber kebenaran: `fe/lib/features/shell/nav_items.dart`, `fe/lib/router/route_guard.dart`,
-> `src/routes/index.ts`, dan `plan-backend-v2-refund-rusak-opname-rbac.md` §3.
+> `src/routes/index.ts`, `plan-backend-v2-refund-rusak-opname-rbac.md` §3, dan **amandemen FE-11**.
 > Matriks ini **final** — jangan dibalik.
 
-## 1. Model RBAC
+## 1. Model RBAC (final FE-11)
 
 | Role | Peran | Hak |
 |---|---|---|
-| **KASIR** | Operator | Semua **mutasi**: POS, master, pembelian, opname, retur distributor, shift, catat pengeluaran, konfigurasi |
-| **OWNER** | Monitor | Semua **GET/laporan** (read-only). Semua mutasi → `403 FORBIDDEN` |
+| **KASIR** | Operator | Semua **mutasi** POS & operasional harian: POS, master, pembelian, opname, retur distributor, shift, konfigurasi |
+| **OWNER** | Monitor | **Semua GET/laporan** (read-only) **+ pengeluaran operasional sepenuhnya** (input + lihat) |
 
+- Amandemen FE-11: pengeluaran operasional (`POST`/`PATCH`/`GET /expenses`) pindah ke **OWNER**
+  sepenuhnya; KASIR tidak punya menu pengeluaran apa pun.
 - Login: `username=owner` / `username=kasir1` (lihat `src/db/seed.ts`).
 - Halaman awal setelah login: **KASIR → `/pos`**, **OWNER → `/dashboard`**.
 
-## 2. Daftar Menu KASIR (11 menu)
+## 2. Daftar Menu KASIR (10 menu)
 
 | # | Menu | Path | Akses | Fungsi |
 |---|---|---|---|---|
@@ -27,39 +29,50 @@
 | 7 | Opname | `/opname` | mutasi | Stok opname per batch + cause selisih |
 | 8 | Retur Distributor | `/supplier-returns` | mutasi | Retur stok rusak ke supplier + settle dana |
 | 9 | Shift | `/shift` | mutasi | Buka/tutup shift kasir + selisih kas |
-| 10 | Catat Pengeluaran | `/expenses/new` | mutasi | Input opex (daftar khusus owner) |
-| 11 | Pengaturan | `/settings` | mutasi | Printer bluetooth, metode bayar, profil toko |
+| 10 | Pengaturan | `/settings` | mutasi | Printer bluetooth, metode bayar, profil toko |
 
-## 3. Daftar Menu OWNER (6 menu)
+> Menu `Catat Pengeluaran` **dihapus** dari KASIR (11 → 10) oleh amandemen FE-11.
+
+## 3. Daftar Menu OWNER (8 menu)
 
 | # | Menu | Path | Akses | Fungsi |
 |---|---|---|---|---|
 | 1 | Dashboard | `/dashboard` | owner | Ringkasan hari ini, piutang, low stock, expiring, terlaris |
 | 2 | P&L | `/reports/pnl` | owner | Laba rugi bulanan: pendapatan, HPP, laba kotor, opex |
 | 3 | Laporan Opname | `/reports/opname` | owner | Rekap selisih opname per cause dan kategori |
-| 4 | Pengeluaran | `/expenses` | owner | Daftar pengeluaran operasional (lihat saja) |
-| 5 | Riwayat | `/sales` | baca | Daftar penjualan (lihat saja, tanpa mutasi) |
-| 6 | Stok & Ledger | `/stock` | baca | Stok on hand, stok rusak, ledger (lihat saja) |
+| 4 | Pengeluaran | `/expenses` | owner | Daftar pengeluaran operasional (lihat + koreksi) |
+| 5 | Catat Pengeluaran | `/expenses/new` | owner | Input/koreksi opex: gaji, listrik, internet, dst. |
+| 6 | Riwayat | `/sales` | baca | Daftar penjualan (lihat saja, tanpa mutasi) |
+| 7 | Stok & Ledger | `/stock` | baca | Stok on hand, stok rusak, ledger (lihat saja) |
+| 8 | Opname | `/opname` | baca | Riwayat opname + selisih & nilai rugi/lebih (lihat saja) |
+
+> Menu OWNER jadi **8** (6 matriks §3 + **Catat Pengeluaran** amandemen FE-11 +
+> **Opname** read-only FE-6.2).
 
 ## 4. Perbedaan
 
 | Kategori | Jumlah | Menu |
 |---|---|---|
-| **Hanya KASIR** | 9 | POS, Piutang, Barang Masuk, Master, Opname, Retur Distributor, Shift, Catat Pengeluaran, Pengaturan |
-| **Hanya OWNER** | 4 | Dashboard, P&L, Laporan Opname, Pengeluaran |
-| **Bersama (read-only utk OWNER)** | 2 | Riwayat (`/sales`), Stok & Ledger (`/stock`) |
+| **Hanya KASIR** | 7 | POS, Piutang, Barang Masuk, Master, Retur Distributor, Shift, Pengaturan |
+| **Hanya OWNER** | 5 | Dashboard, P&L, Laporan Opname, Pengeluaran, Catat Pengeluaran |
+| **Bersama (read-only utk OWNER)** | 3 | Riwayat (`/sales`), Stok & Ledger (`/stock`), Opname (`/opname`) |
 
 ### Perbedaan sifat akses
-- **KASIR** boleh `POST`/`PATCH`/`DELETE` (semua mutasi).
-- **OWNER** hanya `GET` — dikecualikan: `GET /expenses` dan `/reports/*` justru **OWNER-only**.
+- **KASIR** boleh `POST`/`PATCH`/`DELETE` mutasi operasional (POS, master, pembelian, opname,
+  retur, shift, pengaturan).
+- **OWNER** hanya `GET` — kecuali: `POST`/`PATCH`/`GET /expenses` dan `/reports/*` justru
+  **OWNER-only** (amandemen FE-11).
 - Deep-link ke menu role lain → guard `go_router` redirect ke home + snackbar:
   - KASIR buka menu OWNER → *"Halaman ini khusus owner."*
   - OWNER buka menu KASIR → *"Menu ini khusus kasir — owner hanya melihat laporan."*
 
 ### Catatan unik
-- **KASIR boleh input pengeluaran** (`POST /expenses`) **tapi tidak boleh melihat daftarnya** (`GET /expenses` = OWNER).
-- Both role boleh baca: `/sales`, `/stock`, `/alerts`, `/cash-sessions`, `/opnames`, `/supplier-returns` (detail), `/store` (profil toko).
-- Yang berubah dari RBAC lama: OWNER di-block dari **semua** mutasi; input opex & payment-methods & profil toko pindah ke KASIR.
+- **OWNER boleh input & melihat pengeluaran** (`GET`/`POST`/`PATCH /expenses`) — KASIR **tidak**
+  punya menu pengeluaran dan mendapat `403` untuk `GET`/`POST`/`PATCH /expenses`.
+- Both role boleh baca: `/sales`, `/stock`, `/opnames` (detail), `/supplier-returns` (detail),
+  `/cash-sessions`, `/store` (profil toko).
+- Yang berubah dari RBAC lama: OWNER di-block dari semua mutasi **kecuali pengeluaran**; input
+  payment-methods & profil toko tetap di KASIR.
 
 ## 5. Peta Menu → Endpoint API
 
@@ -76,7 +89,6 @@
 | Opname | `/opname` | `GET /opnames`, `POST /opnames`, `GET /opnames/{id}` | GET both · POST KASIR |
 | Retur Distributor | `/supplier-returns` | `GET /stock/damaged`, `POST /supplier-returns`, `GET /supplier-returns`, `GET /supplier-returns/{id}`, `POST /supplier-returns/{id}/settle` | GET both · mutasi KASIR |
 | Shift | `/shift` | `GET /cash-sessions`, `GET /cash-sessions/{id}`, `POST /cash-sessions/open`, `POST /cash-sessions/{id}/close` | GET both · mutasi KASIR |
-| Catat Pengeluaran | `/expenses/new` | `POST /expenses`, `PATCH /expenses/{id}` | KASIR |
 | Pengaturan | `/settings` | `GET/POST/PATCH /payment-methods`, `GET /store`, `PATCH /store` | GET both · mutasi KASIR |
 
 ### Menu OWNER
@@ -87,8 +99,10 @@
 | P&L | `/reports/pnl` | `GET /reports/pnl?month=YYYY-MM` | OWNER |
 | Laporan Opname | `/reports/opname` | `GET /reports/opname?month=YYYY-MM` | OWNER |
 | Pengeluaran | `/expenses` | `GET /expenses`, `GET /expenses/{id}` | OWNER |
+| Catat Pengeluaran | `/expenses/new` | `POST /expenses`, `PATCH /expenses/{id}` | OWNER |
 | Riwayat | `/sales` | `GET /sales`, `GET /sales/{id}`, `GET /sales/{id}/receipt`, `GET /sales/{id}/payments` | both (read-only) |
 | Stok & Ledger | `/stock` | `GET /stock`, `GET /stock/damaged`, `GET /stock/movements`, `GET /stock/products/{id}`, `GET /alerts` | both (read-only) |
+| Opname | `/opname` | `GET /opnames`, `GET /opnames/{id}` | both (read-only) |
 
 > `/receivables` adalah **route UI saja** — tidak ada endpoint `/receivables` di openapi;
 > datanya dari `GET /sales` difilter status pembayaran + pelunasan via `POST /sales/{id}/payments`.
@@ -118,7 +132,7 @@
 | `/stock`, `/stock/damaged`, `/stock/movements`, `/stock/products/{id}`, `/alerts` | GET | ✅ | ✅ |
 | `/supplier-returns`, `/supplier-returns/{id}` | GET | ✅ | ✅ |
 | `/supplier-returns`, `/supplier-returns/{id}/settle` | POST | ✅ | ❌ 403 |
-| `/expenses` | POST/PATCH | ✅ | ❌ 403 |
+| `/expenses`, `/expenses/{id}` | POST/PATCH | ❌ 403 | ✅ (**OWNER-only**, amandemen FE-11) |
 | `/expenses`, `/expenses/{id}` | GET | ❌ 403 | ✅ (**OWNER-only**) |
 | `/reports/dashboard`, `/reports/pnl`, `/reports/opname` | GET | ❌ 403 | ✅ (**OWNER-only**) |
 | `/store` | PATCH | ✅ | ❌ 403 |

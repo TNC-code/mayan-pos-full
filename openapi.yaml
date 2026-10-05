@@ -8,18 +8,19 @@ info:
     anti-overpay, void auditable. Pembayaran mendukung PARTIAL & multi metode
     (CASH / BANK_TRANSFER / configurable via menu payment_methods).
 
-    **RBAC v2** — KASIR = operator (semua mutasi: master, pembelian, POS, opname, opex,
-    payment-methods, profil toko), OWNER = monitor read-only (403 di semua mutasi).
-    `GET /expenses`, `GET /expenses/{id}` dan seluruh `/reports/*` hanya OWNER.
-    Semua GET lain terbuka untuk kedua role.
-
+    **RBAC v2 + amandemen FE-11** — KASIR = operator (semua mutasi: master, pembelian, POS,
+    opname, payment-methods, profil toko), OWNER = monitor read-only (403 di semua mutasi
+    selain opex). Pengeluaran operasional **OWNER sepenuhnya** (revisi user): input + baca
+    `POST /expenses`, `PATCH /expenses/{id}`, `GET /expenses`, `GET /expenses/{id}` hanya OWNER;
+    KASIR 403 di keempatnya. Seluruh `/reports/*` hanya OWNER. Semua GET lain terbuka untuk
+    kedua role.
     **Pemisahan data uji (v2.1)** — `sales`, `operational_expenses` dan `supplier_returns`
     punya flag `is_test`; semua laporan production-only mengecualikannya secara default dan
     membuka lewat `?include_test=true` (`GET /sales`, `GET /expenses`, `GET /reports/pnl`).
   x-rbac: |
-    KASIR = operator: semua POST/PATCH/DELETE (mutasi), termasuk POST /expenses.
-    OWNER = monitor: semua GET, namun TIDAK boleh mutasi apa pun (403).
-    Pengecualian GET: /expenses* dan seluruh /reports/* hanya OWNER (KASIR 403).
+    KASIR = operator: semua POST/PATCH/DELETE (mutasi) KECUALI opex.
+    OWNER = monitor + opex: semua GET; mutasi selain `POST/PATCH /expenses` tetap 403.
+    Pengecualian: /expenses* (GET/POST/PATCH) dan seluruh /reports/* hanya OWNER (KASIR 403).
 servers:
   - url: http://localhost:3000/api/v1
     description: Local
@@ -909,7 +910,8 @@ paths:
       tags: [Expenses]
       summary: List pengeluaran operasional (OWNER only)
       description: |
-        Kasir boleh MENGINPUT opex (`POST`) tapi tidak boleh membacanya (403).
+        Pengeluaran operasional = **OWNER sepenuhnya** (amandemen FE-11): kasir tidak boleh
+        melihat, menginput, maupun mengoreksi opex (403 di GET/POST/PATCH).
         Opex dari skrip uji (`is_test`) disembunyikan secara default;
         `?include_test=true` untuk melihat semuanya.
       parameters:
@@ -929,7 +931,7 @@ paths:
         '403': { description: "KASIR tidak diizinkan (RBAC v2 - laporan khusus OWNER)" }
     post:
       tags: [Expenses]
-      summary: Catat pengeluaran operasional — gaji/listrik/internet (KASIR only)
+      summary: Catat pengeluaran operasional — gaji/listrik/internet (OWNER only)
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKeyOptional' }
       requestBody:
@@ -943,7 +945,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Expense' }
-        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '403': { description: "KASIR tidak diizinkan (amandemen FE-11 — opex = OWNER penuh)" }
 
   /expenses/{id}:
     parameters: [{ $ref: '#/components/parameters/Id' }]
@@ -960,7 +962,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Expenses]
-      summary: Update/koreksi pengeluaran (KASIR only)
+      summary: Update/koreksi pengeluaran (OWNER only)
       requestBody:
         required: true
         content:
@@ -973,7 +975,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Expense' }
         '400': { $ref: '#/components/responses/BadRequest' }
-        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '403': { description: "KASIR tidak diizinkan (amandemen FE-11 — opex = OWNER penuh)" }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /reports/pnl:

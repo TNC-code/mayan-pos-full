@@ -77,7 +77,7 @@ export interface ExpenseInput {
   is_test?: boolean;
 }
 
-/** Pengeluaran operasional (gaji, listrik, internet, dst). Input = KASIR, baca = OWNER. */
+/** Pengeluaran operasional (gaji, listrik, internet, dst). Input = baca = OWNER (amandemen RBAC FE-11). */
 export async function createExpense(input: ExpenseInput, createdBy: number | null): Promise<ExpenseRow> {
   return withTx(async (client) => {
     const res = await client.query<{ id: number }>(
@@ -96,7 +96,7 @@ export async function createExpense(input: ExpenseInput, createdBy: number | nul
   }, 'expense-create');
 }
 
-/** Kasir boleh mengoreksi (input dan update). Kategori dinormalisasi UPPERCASE. */
+/** Owner boleh mengoreksi (input dan update). Kategori dinormalisasi UPPERCASE. */
 export async function updateExpense(id: number, input: Partial<ExpenseInput>): Promise<ExpenseRow> {
   return withTx(async (client) => {
     const cur = await client.query<{ id: number }>(

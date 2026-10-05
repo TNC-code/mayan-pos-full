@@ -479,27 +479,35 @@ OP_ITEMS=$(jqv total.item_count < /tmp/r.json)
 contains "P7 opname report ada kolom stok rusak" "stok_rusak_belum_diretur" "$(body)"
 TOKEN=$SAVED
 
-hr "Matriks RBAC (KASIR = operator, OWNER = monitor)"
+hr "Matriks RBAC (KASIR = operator, OWNER = monitor; opex = OWNER penuh)"
 SAVED=$TOKEN; TOKEN=$KASIR_TOKEN
 for P in "/reports/pnl?month=$MONTH" "/reports/dashboard" "/reports/opname?month=$MONTH" "/expenses"; do
   CODE=$(get "$API$P"); check "R1 kasir $P -> 403" 403 "$CODE"
 done
 CODE=$(get "$API/expenses/5"); check "R2 kasir /expenses/{id} -> 403" 403 "$CODE"
-TOKEN=$SAVED
+# Amandemen FE-11: pengeluaran operasional = OWNER sepenuhnya -> kasir tidak boleh
+# menginput opex lagi (sebelumnya kasir boleh POST /expenses).
 CODE=$(post "$API/expenses" '{"category":"TEST_RBAC","amount":1000}')
-check "R3 kasir POST /expenses 201 (boleh input opex)" 201 "$CODE" "$(body)"
-OPEX_RBAC=$(jqv id < /tmp/r.json)
+check "R3a kasir POST /expenses -> 403" 403 "$CODE" "$(body)"
+CODE=$(patch "$API/expenses/5" '{"amount":1500}')
+check "R3b kasir PATCH /expenses/{id} -> 403" 403 "$CODE" "$(body)"
+TOKEN=$SAVED
 CODE=$(post "$API/products" "{\"sku\":\"TEST-RBAC-$RUN_TAG\",\"name\":\"TEST RBAC operator\"}")
 check "R4 kasir POST /products 201 (boleh input master)" 201 "$CODE" "$(body)"
 PROD_RBAC=$(jqv id < /tmp/r.json)
 TOKEN=$OWNER_TOKEN
+CODE=$(post "$API/expenses" '{"category":"TEST_RBAC_O","amount":1000}')
+check "R6a owner POST /expenses 201 (boleh input opex)" 201 "$CODE" "$(body)"
+OPEX_RBAC=$(jqv id < /tmp/r.json)
+CODE=$(patch "$API/expenses/$OPEX_RBAC" '{"amount":1500}')
+check "R6b owner PATCH /expenses/{id} 200 (boleh koreksi opex)" 200 "$CODE" "$(body)"
+check "R6c amount opex ter-update" "1500" "$(jqv amount < /tmp/r.json)"
 CODE=$(post "$API/products" "{\"sku\":\"TEST-RBACO-$RUN_TAG\",\"name\":\"TEST RBAC owner\"}"); check "R5 owner POST /products -> 403" 403 "$CODE" "$(body)"
-CODE=$(post "$API/expenses" '{"category":"TEST_RBAC_O","amount":1000}'); check "R6 owner POST /expenses -> 403" 403 "$CODE"
-CODE=$(post "$API/purchases" '{"product_id":1,"qty":1,"unit_cost":1}'); check "R7 owner POST /purchases -> 403" 403 "$CODE"
-CODE=$(post "$API/sales" '{"items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")"); check "R8 owner POST /sales -> 403" 403 "$CODE"
-CODE=$(post "$API/opnames" '{"items":[]}'); check "R9 owner POST /opnames -> 403" 403 "$CODE"
-CODE=$(post "$API/supplier-returns" '{"supplier_name":"X","items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")"); check "R10 owner POST /supplier-returns -> 403" 403 "$CODE"
-CODE=$(patch "$API/store" '{"name":"x"}'); check "R11 owner PATCH /store -> 403" 403 "$CODE"
+CODE=$(post "$API/purchases" '{"product_id":1,"qty":1,"unit_cost":1}'); check "R7 owner POST /purchases -> 403" 403 "$CODE" "$(body)"
+CODE=$(post "$API/sales" '{"items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")"); check "R8 owner POST /sales -> 403" 403 "$CODE" "$(body)"
+CODE=$(post "$API/opnames" '{"items":[]}'); check "R9 owner POST /opnames -> 403" 403 "$CODE" "$(body)"
+CODE=$(post "$API/supplier-returns" '{"supplier_name":"X","items":[]}' "$(node -e "console.log(require('crypto').randomUUID())")"); check "R10 owner POST /supplier-returns -> 403" 403 "$CODE" "$(body)"
+CODE=$(patch "$API/store" '{"name":"x"}'); check "R11 owner PATCH /store -> 403" 403 "$CODE" "$(body)"
 CODE=$(get "$API/reports/pnl?month=$MONTH"); check "R12 owner laporan P&L tetap 200" 200 "$CODE"
 CODE=$(get "$API/expenses"); check "R13 owner GET /expenses 200" 200 "$CODE"
 CODE=$(get "$API/products"); check "R14 owner GET /products 200 (tetap baca)" 200 "$CODE"
@@ -508,6 +516,7 @@ TOKEN=$KASIR_TOKEN
 CODE=$(get "$API/auth/me"); check "R16 kasir auth/me 200" 200 "$CODE"
 CODE=$(get "$API/sales"); check "R17 kasir GET /sales 200 (semua role boleh baca)" 200 "$CODE"
 CODE=$(get "$API/stock/damaged"); check "R18 kasir GET /stock/damaged 200" 200 "$CODE"
+CODE=$(get "$API/payment-methods?active_only=false"); check "R19 kasir GET /payment-methods (semua) 200" 200 "$CODE"
 
 hr "Pembersihan data uji"
 step "nonaktifkan produk uji (soft delete) + nonaktifkan metode uji"
@@ -518,7 +527,7 @@ done
 CODE=$(patch "$API/payment-methods/$EWALLET_ID" '{"is_active":false,"notes":"nonaktif setelah uji e2e"}')
 check "c2x metode uji nonaktif" 200 "$CODE" "$(body)"
 
-step "tandai opex uji (R3) supaya tidak masuk P&L produksi"
+step "tandai opex uji (R6a) supaya tidak masuk P&L produksi"
 TOKEN=$OWNER_TOKEN
 CODE=$(get "$API/expenses/$OPEX_RBAC"); check "c5x detail opex uji (OWNER) 200" 200 "$CODE"
 TOKEN=$KASIR_TOKEN

@@ -124,7 +124,7 @@ GROUP BY p.id, p.sku, p.barcode, p.name, p.unit;
 
 ### FASE 8 — Pengeluaran Operasional & Laba Bersih/Netto (SELESAI)
 - [x] Tabel `operational_expenses` (migration 0002): category dinormalisasi, `amount > 0`, audit created/updated
-- [x] `GET/POST /expenses`, `GET/PATCH /expenses/{id}` — **input = KASIR, baca/laporan = OWNER**
+- [x] `GET/POST /expenses`, `GET/PATCH /expenses/{id}` — ~~input = KASIR, baca/laporan = OWNER~~ → **amandemen FE-11: input + baca = OWNER** (kasir 403 di keempatnya)
 - [x] `GET /reports/pnl?month=YYYY-MM` — OWNER-only: pendapatan, HPP, laba kotor, beban per kategori, `refund_distributor`, **laba bersih = laba kotor + refund_distributor − opex**, laba netto, piutang berjalan. Basis akrual (sales COMPLETED periode, TZ Asia/Jakarta)
 - **Done when:** kasir input gaji/listrik/internet → P&L ter-update; owner bisa baca, kasir tidak. ✅
 
@@ -160,11 +160,16 @@ BARANG RUSAK (refund/void berlabel RUSAK)
 | P&L | `refund_distributor` | = Σ `refunded_amount` retur status REFUNDED per `refunded_at` (TZ Asia/Jakarta) |
 | Data uji | `operational_expenses.is_test` + `?include_test=true` | Opex uji disembunyikan dari daftar default & P&L; `npm run mark-test-data` |
 
-### RBAC (keputusan final plan §8)
+### RBAC (keputusan final plan §8) — **+ amandemen FE-11 (revisi user)**
+> **Amandemen FE-11:** pengeluaran operasional (`/expenses`) menjadi **OWNER sepenuhnya** —
+> input (`POST`/`PATCH`) ikut pindah ke OWNER, bukan hanya baca. KASIR tidak punya menu
+> maupun kapasitas pengeluaran apa pun → 403 di `GET/POST/PATCH /expenses`. Mutasi lain
+> tetap KASIR; `/reports/*` tetap OWNER-only.
+
 | Role | Boleh | Ditolak |
 |---|---|---|
-| **KASIR** (operator) | Semua POST/PATCH/DELETE (master, pembelian, POS, void/refund, opname, cash session, retur distributor, **input opex**, payment-methods, profil toko) + semua GET | `GET /expenses`, `GET /expenses/{id}`, seluruh `/reports/*` (403) |
-| **OWNER** (monitor) | Semua GET (termasuk laporan & daftar opex) | **Semua mutasi** (403), termasuk `POST /expenses` & `PATCH /store` |
+| **KASIR** (operator) | Semua POST/PATCH/DELETE (master, pembelian, POS, void/refund, opname, cash session, retur distributor, payment-methods, profil toko) + semua GET kecuali daftar laporan | `GET /expenses`, `GET /expenses/{id}`, **`POST /expenses`, `PATCH /expenses/{id}`** (amandemen FE-11), seluruh `/reports/*` (403) |
+| **OWNER** (monitor + opex) | Semua GET (termasuk laporan & daftar opex) **+ input/koreksi opex** | Semua mutasi lain (403), termasuk `POST /purchases`, `POST /sales`, `PATCH /store` |
 
 ### Error baru (backend v2)
 | Code | HTTP | Kapan |

@@ -15,14 +15,18 @@ import * as storeCtrl from '../controllers/store.controller.js';
 import * as S from '../controllers/schemas.js';
 
 /**
- * RBAC v2 (plan-backend-v2 §3 + §8.1: OWNER read-only total).
+ * RBAC v2 (plan-backend-v2 §3 + §8.1) **+ amandemen FE-11 (keputusan user)**.
  *
- *   KASIR = operator  -> semua mutasi (input master, pembelian, POS, opname, opex, konfigurasi)
+ *   KASIR = operator  -> semua mutasi (input master, pembelian, POS, opname, konfigurasi)
  *   OWNER = monitor   -> semua GET, termasuk seluruh `/reports/*` dan daftar opex
  *
- * Konsekuensi: OWNER tidak lagi bisa POST/PATCH/DELETE apa pun; kasir boleh input opex
- * tapi tidak boleh membacanya (`GET /expenses` & `/reports/*` tetap OWNER).
+ * Konsekuensi: OWNER tidak lagi bisa POST/PATCH/DELETE apa pun; kasir boleh input
+ * operasional biasa tapi tidak boleh membacanya (`GET /expenses` & `/reports/*` OWNER).
  * GET lain (sales, stock, opnames, ledger, alerts, cash-sessions, dst.) terbuka untuk semua role.
+ *
+ * **Amandemen (revisi user, FE-11):** pengeluaran operasional jadi **OWNER sepenuhnya** —
+ * input (`POST`/`PATCH /expenses`) ikut pindah ke OWNER. Kasir tidak punya menu/kapasitas
+ * pengeluaran apa pun (list, input, ubah) → 403 di ketiga endpoint. Semua mutasi lain tetap KASIR.
  */
 const KASIR = requireRole('KASIR');
 const OWNER = requireRole('OWNER');
@@ -108,7 +112,8 @@ export function buildRouter(): Router {
   r.post('/supplier-returns/:id/settle', KASIR, requireIdempotencyKey, vBody(S.supplierReturnSettleSchema), h(supplierReturnCtrl.settleSupplierReturn));
 
   /* ------------- OWNER only (RBAC) =------------ */
-  // KASIR boleh MENGINPUT opex, tapi tidak boleh membacanya; semua laporan hanya OWNER.
+  // Pengeluaran operasional = OWNER penuh (amandemen FE-11): kasir tidak boleh
+  // melihat maupun menginput opex; seluruh `/reports/*` juga khusus OWNER.
   r.get('/expenses', OWNER, vQuery(S.expenseListSchema), h(expenseCtrl.listExpenses));
   r.get('/expenses/:id', OWNER, h(expenseCtrl.getExpense));
   r.get('/reports/pnl', OWNER, vQuery(S.pnlQuerySchema), h(expenseCtrl.pnl));
@@ -117,9 +122,9 @@ export function buildRouter(): Router {
   // Semua role boleh baca (dipakai layar kasir untuk monitoring stok & expiring).
   r.get('/alerts', h(expenseCtrl.alerts));
 
-  /* --------- input (KASIR): opex, metode bayar, profil toko --------- */
-  r.post('/expenses', KASIR, vBody(S.expenseCreateSchema), h(expenseCtrl.createExpense));
-  r.patch('/expenses/:id', KASIR, vBody(S.expenseUpdateSchema), h(expenseCtrl.updateExpense));
+  /* --------- input opex (OWNER, amandemen FE-11) + konfigurasi (KASIR) --------- */
+  r.post('/expenses', OWNER, vBody(S.expenseCreateSchema), h(expenseCtrl.createExpense));
+  r.patch('/expenses/:id', OWNER, vBody(S.expenseUpdateSchema), h(expenseCtrl.updateExpense));
 
   // Profil toko: semua role boleh baca (dipakai header nota kasir), hanya kasir boleh ubah.
   r.get('/store', h(storeCtrl.getStore));
