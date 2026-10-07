@@ -382,3 +382,89 @@ export const storeUpdateSchema = z.object({
   receipt_footer: z.string().trim().max(500).nullish(),
   logo_url: z.string().trim().max(500).nullish(),
 }).refine((v) => Object.keys(v).length > 0, { message: 'minimal satu field untuk update' });
+
+/* ---------------------------- order books (WA) ---------------------------- */
+
+/**
+ * Nomor WhatsApp customer -> format Indonesia (62...). Bot mengirim apa adanya
+ * hasil parse (mis. "0812-3456-7890"), jadi normalisasi di server supaya
+ * auto-register customer tidak menghasilkan customer ganda untuk satu nomor.
+ */
+function normalizeWaPhone(raw: string): string {
+  const digits = raw.replace(/[^0-9]/g, '');
+  if (digits.startsWith('62')) return digits;
+  if (digits.startsWith('0')) return `62${digits.slice(1)}`;
+  if (digits.startsWith('8')) return `62${digits}`;
+  return `62${digits}`;
+}
+
+const waPhone = z
+  .string()
+  .trim()
+  .min(8, 'customer_phone wajib diisi (nomor WA customer)')
+  .max(24, 'customer_phone terlalu panjang')
+  .regex(/^[0-9+][0-9\s.-]*$/, 'customer_phone hanya boleh angka (boleh spasi, titik, tanda hubung, atau +)')
+  .transform(normalizeWaPhone);
+
+const orderBookItemInputSchema = z.object({
+  // product_id opsional: bot boleh mengirim item yang belum ketemu produknya
+  // (UNMATCHED) -> kasir yang memilih produknya sebelum order di-convert.
+  product_id: id.nullish(),
+  // Nama deskriptif dari AI/matcher (bukan nama katalog) - tetap disimpan walau produk kosong.
+  product_name: z.string().trim().min(1, 'product_name wajib diisi').max(200),
+  raw_text: z.string().trim().max(500).nullish(),
+  qty,
+  // Confidence fuzzy dari bot (0..1) - disimpan supaya kasir tahu seberapa yakin
+  // matcher. Boleh kosong (bot belum mengirim / belum_match).
+  match_score: z.coerce.number().min(0).max(1).nullish(),
+});
+
+export const orderBookCreateSchema = z.object({
+  customer_phone: waPhone,
+  customer_name: z.string().trim().max(200).nullish(),
+  // Chat asli (audit AI); disimpan apa adanya supaya bisa ditelusuri ulang.
+  raw_message: z.string().trim().min(1, 'raw_message wajib diisi').max(4000),
+  note: z.string().trim().max(500).nullish(),
+  items: z.array(orderBookItemInputSchema).min(1, 'minimal 1 item order book'),
+});
+
+export const orderBookListSchema = z.object({
+  status: z.enum(['PENDING', 'PROCESSING', 'DONE', 'CANCELLED']).optional(),
+  date_from: dateStr.optional(),
+  date_to: dateStr.optional(),
+  q: z.string().trim().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+/** Kasir perbaiki item: pilih produk (re-snapshot harga) dan/atau ubah qty. */
+export const orderBookItemPatchSchema = z
+  .object({
+    product_id: id.nullish(),
+    qty: qty.optional(),
+  })
+  .refine((v) => v.product_id !== undefined || v.qty !== undefined, {
+    message: 'minimal satu field untuk update (product_id / qty)',
+  });
+
+/** DONE hanya lewat `POST /order-books/{id}/convert` setelah penjualan nyata. */
+export const orderBookStatusSchema = z
+  .object({
+    status: z.enum(['PROCESSING', 'CANCELLED']),
+    // CANCELLED wajib alasan (padanan reason pada void penjualan).
+    reason: z.string().trim().max(500).nullish(),
+  })
+  .superRefine((val, ctx) => {
+    const reason = val.reason ?? '';
+    if (val.status === 'CANCELLED' && reason.length < 3) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reason'],
+        message: 'alasan pembatalan wajib diisi (minimal 3 karakter)',
+      });
+    }
+  });
+
+export const orderBookConvertSchema = z.object({
+  sale_id: id,
+});

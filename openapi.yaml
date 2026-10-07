@@ -17,6 +17,15 @@ info:
     **Pemisahan data uji (v2.1)** — `sales`, `operational_expenses` dan `supplier_returns`
     punya flag `is_test`; semua laporan production-only mengecualikannya secara default dan
     membuka lewat `?include_test=true` (`GET /sales`, `GET /expenses`, `GET /reports/pnl`).
+  x-auth-order-books: |
+    `POST /order-books` (tag `Order Books`) adalah satu-satunya endpoint dengan DUA jalur auth:
+      1. header `X-Internal-Key` == env `INTERNAL_API_KEY` -> bot WhatsApp (tanpa JWT),
+         `created_by` = user sistem `bot` (seed migration 0009, `is_active=false`).
+      2. tanpa header itu -> JWT biasa, role KASIR (kasir membuat order manual).
+    Header yang ada tapi salah -> `401 INTERNAL_KEY_INVALID` (tidak jatuh ke jalur JWT).
+    `INTERNAL_API_KEY` belum diset di server -> semua panggilan internal key ditolak 401.
+    Endpoint order book lain (`GET`, `PATCH`/`DELETE` item, `/status`, `/convert`) tetap
+    JWT biasa + RBAC KASIR untuk mutasinya.
   x-rbac: |
     KASIR = operator: semua POST/PATCH/DELETE (mutasi) KECUALI opex.
     OWNER = monitor + opex: semua GET; mutasi selain `POST/PATCH /expenses` tetap 403.
@@ -37,6 +46,8 @@ tags:
   - name: Supplier Returns
   - name: Expenses
   - name: Reports
+  - name: Order Books
+  - name: Internal
 security:
   - bearerAuth: []
 
@@ -50,6 +61,13 @@ x-error-codes:
   TRANSITION_NOT_ALLOWED: '409 - status sales tidak dapat diubah lagi'
   VOID_NOT_ALLOWED: '409 - sales sudah dibayar; gunakan retur/refund'
   FORBIDDEN: '403 - role tidak berwenang (RBAC)'
+  INTERNAL_KEY_INVALID: '401 - X-Internal-Key kosong/salah, atau INTERNAL_API_KEY belum diset di server'
+  ORDER_NOT_FOUND: '404 - order book tidak ada'
+  ORDER_ITEM_NOT_FOUND: '404 - item bukan milik order book tsb / tidak ada'
+  ORDER_ALREADY_DONE: '409 - order sudah DONE ke penjualan lain'
+  ORDER_STATUS_TRANSITION: '409 - transisi status order book tidak diizinkan (DONE/CANCELLED tidak bisa diubah)'
+  ORDER_CONVERT_INVALID: '422 - penjualan tujuan convert tidak ada atau bukan COMPLETED'
+  ORDER_LAST_ITEM: '422 - item terakhir tidak boleh dihapus (order minimal 1 item)'
 
 paths:
   /auth/login:
@@ -1124,12 +1142,245 @@ paths:
         '409': { description: 'SUPPLIER_RETURN_SETTLED — retur sudah diselesaikan' }
         '422': { $ref: '#/components/responses/Unprocessable' }
 
+  /order-books:
+    get:
+      tags: [Order Books]
+      summary: Daftar order book WhatsApp (filter status/tanggal/pencarian)
+      description: |
+        Draft pesanan dari chat WhatsApp. **Tidak menyentuh stok maupun ledger** — order
+        hanya jadi penjualan lewat kasir (checkout POS normal lalu `POST /{id}/convert`).
+        Terbaca semua role (dipakai layar kasir "Order WA").
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, PROCESSING, DONE, CANCELLED] } }
+        - { name: date_from, in: query, schema: { type: string, format: date }, description: 'filter tanggal dibuat (TZ bisnis)' }
+        - { name: date_to, in: query, schema: { type: string, format: date } }
+        - { name: q, in: query, schema: { type: string }, description: 'order_no / nama / nomor customer' }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/OrderBook' }
+    post:
+      tags: [Order Books]
+      summary: Buat order book dari chat WA (bot internal key ATAU kasir)
+      description: |
+        Dua jalur auth (lihat `x-auth-order-books`):
+        1. **Bot WhatsApp** — header `X-Internal-Key: <INTERNAL_API_KEY>`. Tidak butuh JWT;
+           `created_by` diisi user sistem `bot` (akun nonaktif, tidak bisa login interaktif).
+        2. **Kasir** — `Authorization: Bearer <JWT>` role KASIR (buat order manual).
+
+        Perilaku header: **ada tapi salah** -> `401 INTERNAL_KEY_INVALID` (tidak diam-diam
+        jatuh ke jalur JWT); kosong -> lanjut ke jalur JWT; `INTERNAL_API_KEY` belum diset
+        di server -> semua request internal key ditolak 401.
+
+        Item dengan `product_id` -> server memvalidasi produk ada & aktif lalu
+        **snapshot `harga_jual`** dan `matched = true`. Item tanpa `product_id` ->
+        **UNMATCHED** (`unit_price = 0`, `matched = false`) untuk dipilih kasir lewat
+        `PATCH /{id}/items/{itemId}`. Server tidak menghitung fuzzy match (itu tugas bot);
+        `match_score` (0..1) hanya diteruskan bila bot mengirimnya.
+
+        `customer_phone` dinormalisasi ke format Indonesia (`62...`); customer di-*auto-register*
+        bila nomor belum ada. Satu transaksi DB (header + items + customer baru).
+      security:
+        - bearerAuth: []
+        - internalKeyAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/InternalKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderBookInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderBookDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: 'INTERNAL_KEY_INVALID (kunci salah/kosong) atau UNAUTHORIZED (tanpa JWT & tanpa key)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+
+  /order-books/{id}:
+    get:
+      tags: [Order Books]
+      summary: Detail order book (items + nomor penjualan bila sudah DONE)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderBookDetail' }
+        '404':
+          description: 'ORDER_NOT_FOUND'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /order-books/{id}/items/{itemId}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - { name: itemId, in: path, required: true, schema: { type: integer } }
+    patch:
+      tags: [Order Books]
+      summary: 'Perbaiki item order book (pilih produk / ubah qty) — KASIR only'
+      description: |
+        Hanya saat order `PENDING`/`PROCESSING` (selain itu `409 ORDER_STATUS_TRANSITION`).
+        `product_id` -> produk divalidasi (ada & aktif), `unit_price` **di-snapshot ulang**
+        dari `harga_jual`, `product_name` diganti nama katalog, `matched = true`.
+        `qty` -> harus > 0. Tanpa `product_id` (hanya `qty`) status match tidak berubah.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderBookItemPatchInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderBookDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404':
+          description: 'ORDER_NOT_FOUND / ORDER_ITEM_NOT_FOUND'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { description: 'ORDER_STATUS_TRANSITION — order sudah DONE/CANCELLED' }
+    delete:
+      tags: [Order Books]
+      summary: 'Hapus item order book — KASIR only'
+      description: |
+        Hanya saat order `PENDING`/`PROCESSING`. Order minimal harus menyisakan 1 item —
+        menghapus item terakhir ditolak `422 ORDER_LAST_ITEM`.
+      responses:
+        '200':
+          description: OK (order book setelah item dihapus)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderBookDetail' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404':
+          description: 'ORDER_NOT_FOUND / ORDER_ITEM_NOT_FOUND'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { description: 'ORDER_STATUS_TRANSITION — order sudah DONE/CANCELLED' }
+        '422': { description: 'ORDER_LAST_ITEM — tidak boleh menyisakan order tanpa item' }
+
+  /order-books/{id}/status:
+    post:
+      tags: [Order Books]
+      summary: Ubah status order book (PROCESSING / CANCELLED) — KASIR only
+      description: |
+        Transisi yang diizinkan: `PENDING -> PROCESSING` dan
+        `PENDING|PROCESSING -> CANCELLED` (alasan **wajib**,minimal 3 karakter, disimpan
+        di `note` — padanan `reason` pada void penjualan). `DONE` **tidak** bisa diset di
+        sini: hanya lewat `POST /{id}/convert`. Pelaku disimpan di `processed_by`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderBookStatusInput' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderBookDetail' }
+        '400':
+          description: 'VALIDATION_ERROR (reason kosong saat CANCELLED)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404': { description: 'ORDER_NOT_FOUND' }
+        '409': { description: 'ORDER_STATUS_TRANSITION — status saat ini tidak memungkinkan' }
+
+  /order-books/{id}/convert:
+    post:
+      tags: [Order Books]
+      summary: Tutup order book jadi DONE setelah checkout POS — KASIR only
+      description: |
+        Dipanggil FE setelah kasir menagih pesanan di POS biasa (`POST /sales` dulu, baru
+        endpoint ini). Guard:
+        * penjualan harus ada & `status = 'COMPLETED'` -> selain itu
+          `422 ORDER_CONVERT_INVALID` (VOIDED/RETURNED bukan bukti order yang valid);
+        * order `CANCELLED` -> `409 ORDER_STATUS_TRANSITION`;
+        * order sudah `DONE` ke penjualan yang sama -> **200 idempotent** (aman untuk retry
+          FE, header `X-Idempotent-Replay: true`), ke penjualan lain -> `409 ORDER_ALREADY_DONE`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderBookConvertInput' }
+      responses:
+        '200':
+          description: 'DONE (atau replay idempotent dari sale yang sama)'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderBookDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: OWNER tidak diizinkan (kasir = operator) }
+        '404': { description: 'ORDER_NOT_FOUND' }
+        '409': { description: 'ORDER_ALREADY_DONE / ORDER_STATUS_TRANSITION' }
+        '422': { description: 'ORDER_CONVERT_INVALID — penjualan tidak valid' }
+
+  /internal/catalog:
+    get:
+      tags: [Internal]
+      summary: Katalog + stok ringkas untuk bot WhatsApp (WA-1) — internal key only
+      description: |
+        Dipakai matcher fuzzy di bot (`src/modules/posOrder/catalog.ts`): bot tidak punya
+        JWT kasir, jadi tidak bisa memakai `GET /products` + `GET /stock`.
+        Endpoint ini **hanya** menerima header `X-Internal-Key` (tidak dibuka ke sesi kasir)
+        dan mengembalikan produk **aktif** saja, digabung dengan stok per batch
+        (`SUM(qty_remaining)` GOOD + `SUM(qty_damaged)` karantina).
+        `harga_beli` sengaja TIDAK dikirim (harga beli tidak keluar ke integrasi luar POS);
+        bot memakai `harga_jual` untuk estimasi balasan ke customer.
+        Dipanggil tiap 5 menit oleh bot (cache lokal) — tidak ada pagination, katalog toko
+        pulse kecil (puluhan–ratusan produk).
+      security:
+        - internalKeyAuth: []
+      parameters:
+        - { $ref: '#/components/parameters/InternalKey' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/InternalCatalogItem' }
+        '401': { description: 'INTERNAL_KEY_INVALID — header X-Internal-Key wajib & benar' }
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    internalKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Internal-Key
+      description: >
+        Kunci integrasi server-to-server (bot WhatsApp -> POS), nilainya harus sama dengan
+        env `INTERNAL_API_KEY` di server. Header ini TIDAK memberi akses ke endpoint lain;
+        hanya `POST /order-books` dan `GET /internal/catalog`. Salah/kosong -> 401 INTERNAL_KEY_INVALID.
 
   parameters:
     Id:
@@ -1137,6 +1388,14 @@ components:
       in: path
       required: true
       schema: { type: integer }
+    InternalKey:
+      name: X-Internal-Key
+      in: header
+      required: false
+      schema: { type: string }
+      description: >
+       WAJIB untuk panggilan bot (tanpa JWT). Kosongkan bila memakai JWT kasir. Ada tapi
+        salah -> 401 INTERNAL_KEY_INVALID (tidak jatuh ke jalur JWT).
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -1944,4 +2203,119 @@ components:
         jml_transaksi: { type: integer }
         piutang_berjalan: { type: number }
         note: { type: string }
+
+    OrderBook:
+      type: object
+      properties:
+        id: { type: integer }
+        order_no: { type: string, example: ORD-20261005-001 }
+        status: { type: string, enum: [PENDING, PROCESSING, DONE, CANCELLED] }
+        source: { type: string, example: WHATSAPP }
+        customer_id: { type: integer, nullable: true }
+        customer_name: { type: string, nullable: true }
+        customer_phone: { type: string, nullable: true, example: '6281234567890', description: 'selalu format 62...' }
+        raw_message: { type: string, nullable: true, description: 'chat asli (audit AI)' }
+        note: { type: string, nullable: true, description: 'catatan kasir / alasan pembatalan' }
+        sale_id: { type: integer, nullable: true, description: 'penjualan hasil convert' }
+        sale_no: { type: string, nullable: true, example: INV-20261005-007, description: 'hanya terisi setelah DONE' }
+        created_by: { type: integer, nullable: true, description: 'user sistem bot (=7 saat seed) untuk order dari bot' }
+        created_by_name: { type: string, nullable: true, example: bot }
+        processed_by: { type: integer, nullable: true }
+        processed_by_name: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        item_count: { type: integer }
+        unmatched_count: { type: integer, description: 'item yang belum punya product_id (perlu dipilih kasir)' }
+        total_qty: { type: number, example: 70.000 }
+        estimated_total: { type: number, format: float, description: 'Σ qty × unit_price item yang sudah match' }
+
+    OrderBookDetail:
+      allOf:
+        - $ref: '#/components/schemas/OrderBook'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/OrderBookItem' }
+
+    OrderBookItem:
+      type: object
+      properties:
+        id: { type: integer }
+        order_book_id: { type: integer }
+        product_id: { type: integer, nullable: true, description: 'NULL = UNMATCHED (kasir belum memilih produk)' }
+        product_name: { type: string, description: 'deskripsi dari AI/matcher, atau nama katalog setelah dipilih kasir' }
+        raw_text: { type: string, nullable: true, description: 'potongan chat asal item ini' }
+        qty: { type: number, example: 30.000 }
+        unit_price: { type: number, format: float, description: 'snapshot harga_jual; 0 selama belum match' }
+        matched: { type: boolean }
+        match_score: { type: number, nullable: true, description: 'confidence fuzzy dari bot (0..1)' }
+        subtotal: { type: number, format: float, description: 'qty × unit_price' }
+
+    OrderBookInput:
+      type: object
+      required: [customer_phone, raw_message, items]
+      properties:
+        customer_phone:
+          type: string
+          description: 'nomor WA customer; dinormalisasi ke 62... (`0812...`, `+62812...`, `812...` semua jadi `62812...`)'
+          example: '0812-3456-7890'
+        customer_name: { type: string, nullable: true, description: 'nama profil WA / nama customer' }
+        raw_message: { type: string, description: 'chat asli (untuk audit; disimpan apa adanya)' }
+        note: { type: string, nullable: true }
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [product_name, qty]
+            properties:
+              product_id: { type: integer, nullable: true, description: 'kosong = UNMATCHED (nama deskriptif saja)' }
+              product_name: { type: string, description: 'deskripsi hasil AI/matcher (mis. "Kartu Tri 30GB 60hr")' }
+              raw_text: { type: string, nullable: true }
+              qty: { type: number, example: 30 }
+              match_score: { type: number, minimum: 0, maximum: 1, nullable: true }
+
+    InternalCatalogItem:
+      type: object
+      description: |
+        Satu produk aktif + stoknya (ringkas, khusus integrasi bot WA). `harga_beli`
+        tidak ada di sini.
+      required: [id, name, qty_on_hand, qty_damaged]
+      properties:
+        id: { type: integer }
+        sku: { type: string, nullable: true }
+        barcode: { type: string, nullable: true }
+        name: { type: string }
+        unit: { type: string, nullable: true }
+        category_id: { type: integer, nullable: true, description: 'FK product_category (bantu matcher bot mengelompokkan)' }
+        category_name: { type: string, nullable: true }
+        harga_jual: { type: number, nullable: true, description: 'harga jual normal (dipakai bot untuk estimasi)' }
+        qty_on_hand: { type: number, description: 'stok GOOD (boleh dijual)' }
+        qty_damaged: { type: number, description: 'barang rusak karantina (informatif)' }
+        unit_conversions:
+          type: object
+          nullable: true
+          additionalProperties: { type: number }
+          description: 'konversi satuan, mis. { pcs: 1, lusin: 10 }'
+
+    OrderBookItemPatchInput:
+      type: object
+      description: 'Minimal satu field. `product_id` memicu re-snapshot harga + `matched = true`.'
+      properties:
+        product_id: { type: integer }
+        qty: { type: number, description: '> 0' }
+
+    OrderBookStatusInput:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [PROCESSING, CANCELLED] }
+        reason: { type: string, nullable: true, description: 'wajib (min 3 karakter) bila status = CANCELLED' }
+
+    OrderBookConvertInput:
+      type: object
+      required: [sale_id]
+      properties:
+        sale_id: { type: integer, description: 'penjualan COMPLETED hasil checkout kasir' }
 

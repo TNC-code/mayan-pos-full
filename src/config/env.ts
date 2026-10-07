@@ -45,6 +45,10 @@ const schema = z.object({
   SEED_OWNER_PASSWORD: z.string().default('owner123'),
   SEED_KASIR_PASSWORD: z.string().default('kasir123'),
   BUSINESS_TZ: z.string().default('Asia/Jakarta'),
+  // Kunci internal untuk integrasi server-to-server (bot WA -> POS). Kosong = fitur
+  // dimatikan: endpoint yang HANYA menerima internal key akan menolak dengan 401
+  // INTERNAL_KEY_INVALID (bukan diam-diam menerima request).
+  INTERNAL_API_KEY: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -77,6 +81,12 @@ export const env = {
     secret: e.JWT_SECRET,
     expiresIn: e.JWT_EXPIRES_IN,
   },
+
+  /**
+   * Kunci internal integrasi bot (X-Internal-Key). Sengaja dibaca apa adanya
+   * (tanpa nilai default) supaya "belum di-set" terdeteksi -> 401 INTERNAL_KEY_INVALID.
+   */
+  internalApiKey: (e.INTERNAL_API_KEY ?? '').trim(),
 
   bcryptRounds: e.BCRYPT_ROUNDS,
 

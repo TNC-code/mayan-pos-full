@@ -8,6 +8,12 @@ PASS=0; FAIL=0
 RUN_TAG="UJI$(date +%H%M%S)"
 PASSED=(); FAILED=()
 
+# Kunci internal integrasi bot WA (header X-Internal-Key) dibaca dari .env.
+IKEY=${INTERNAL_API_KEY:-}
+if [[ -z "$IKEY" && -f .env ]]; then
+  IKEY=$(sed -n "s/^INTERNAL_API_KEY=//p" .env | tr -d '"' | tail -1)
+fi
+
 hr()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 step() { printf '\n\033[36m-- %s\033[0m\n' "$1"; }
 ok()   { PASS=$((PASS+1)); PASSED+=("$1"); printf '  \033[32mPASS\033[0m %s :: %s\n' "$1" "${2:-}"; }
@@ -26,6 +32,13 @@ jqv() { node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{con
 post()  { curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$1" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" ${3:+-H "Idempotency-Key: $3"} -d "$2"; }
 patch() { curl -s -o /tmp/r.json -w '%{http_code}' -X PATCH "$1" -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" -d "$2"; }
 get()   { curl -s -o /tmp/r.json -w '%{http_code}' "$1" -H "Authorization: Bearer $TOKEN"; }
+del()   { curl -s -o /tmp/r.json -w '%{http_code}' -X DELETE "$1" -H "Authorization: Bearer $TOKEN"; }
+# POST dengan X-Internal-Key (jalur bot WA; tanpa Authorization).
+ipost() { curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$1" -H "Content-Type: application/json" -H "X-Internal-Key: $2" -d "$3"; }
+# POST tanpa auth sama sekali (untuk uji 401).
+anon()  { curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$1" -H "Content-Type: application/json" -d "$2"; }
+# POST dengan X-Internal-Key salah (harus 401, bukan jatuh ke jalur JWT).
+badkey() { curl -s -o /tmp/r.json -w '%{http_code}' -X POST "$1" -H "Content-Type: application/json" -H "X-Internal-Key: key-salah" -H "Authorization: Bearer $TOKEN" -d "$2"; }
 body()  { cat /tmp/r.json; }
 
 hr "FASE 0 - auth"
@@ -63,6 +76,13 @@ TOKEN=$KASIR_TOKEN
 # Rekaman stok produk produksi (id=1) SEBELUM uji, untuk cek regresi berbasis delta
 # (toleran bila ada klien lain yang kebetulan memakai produk yang sama).
 P1_BEFORE=$(get "$API/stock?product_id=1" >/dev/null; jqv 0.qty_on_hand < /tmp/r.json)
+
+# Batch produksi yang sudah ada SEBELUM skrip ini jalan, dipakai sebagai.batch penanda
+# "data lama tidak hilang oleh e2e". TIDAK di-hardcode tanggalnya: nomor batch ikut
+# berjalan (dulu assertion-nya terkunci ke GRN-20261004-001 yang sudah tidak berlaku
+# lagi setelah data tersebut hilang/bergeser tanggal -> false negative).
+get "$API/purchases?product_id=1" >/dev/null
+P1_BATCH_CODE=$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const a=JSON.parse(s);console.log((a.find(x=>x.batch_code)||{}).batch_code||'')})" < /tmp/r.json)
 
 hr "FASE 1 - master data"
 step "b) buat produk gula 1kg"
@@ -518,9 +538,170 @@ CODE=$(get "$API/sales"); check "R17 kasir GET /sales 200 (semua role boleh baca
 CODE=$(get "$API/stock/damaged"); check "R18 kasir GET /stock/damaged 200" 200 "$CODE"
 CODE=$(get "$API/payment-methods?active_only=false"); check "R19 kasir GET /payment-methods (semua) 200" 200 "$CODE"
 
+# ============================================================
+#   WA-0 - ORDER BOOK (draft pesanan WhatsApp)
+#   Alur: bot (X-Internal-Key) buat order 2 item (1 match 1 unmatch)
+#         -> kasir perbaiki / hapus item -> convert ke sale uji -> DONE
+#         -> guard: item terakhir, status, convert dobel, cancel tanpa alasan,
+#            produk nonaktif, tanpa key / key salah
+# ============================================================
+hr "WA-0 - order book (bot internal key + kasir)"
+
+# Tag khusus WA: HARUS numerik (customer_phone menolak huruf; RUN_TAG berisi 'UJI').
+PHONE_TAG=$(date +%H%M%S)
+
+step "W) dua produk uji untuk order book"
+CODE=$(post "$API/products" "{\"sku\":\"TEST-WA-$RUN_TAG\",\"name\":\"TEST WA Kartu Tri 30GB\",\"unit\":\"pcs\",\"harga_beli\":20000,\"harga_jual\":25000}")
+check "W1 create produk uji WA 201" 201 "$CODE" "$(body)"
+WA_PROD=$(jqv id < /tmp/r.json)
+CODE=$(post "$API/products" "{\"sku\":\"TEST-WA2-$RUN_TAG\",\"name\":\"TEST WA Voucher TLKM 40GB\",\"unit\":\"pcs\",\"harga_beli\":30000,\"harga_jual\":35000}")
+check "W2 create produk uji WA #2 201" 201 "$CODE" "$(body)"
+WA_PROD2=$(jqv id < /tmp/r.json)
+[[ -n "$WA_PROD$WA_PROD2" ]] && ok "W3 id produk uji ada" "$WA_PROD / $WA_PROD2" || bad "W3 id produk uji ada" "ada yang kosong"
+
+step "W) buat order book via X-Internal-Key (bot WA): 1 match + 1 unmatch"
+WA_MSG='sp tri 30gb 60hr 30pcs vc tlkm 40gb 5hr 40'
+WA_PAYLOAD="{\"customer_phone\":\"0812-3456-$PHONE_TAG\",\"customer_name\":\"Budi WA\",\"raw_message\":\"$WA_MSG\",\"note\":\"chat abstrak (WA-1)\",\"items\":[{\"product_id\":$WA_PROD,\"product_name\":\"Kartu Tri 30GB 60hr\",\"raw_text\":\"sp tri 30gb 60hr 30pcs\",\"qty\":30,\"match_score\":0.91},{\"product_name\":\"Voucher Telkomsel 40GB 5hr\",\"raw_text\":\"vc tlkm 40gb 5hr 40\",\"qty\":40,\"match_score\":0.62}]}"
+CODE=$(ipost "$API/order-books" "$IKEY" "$WA_PAYLOAD")
+check "W4 create order via internal key 201" 201 "$CODE" "$(body)"
+ORD_A=$(jqv id < /tmp/r.json)
+ORD_A_NO=$(jqv order_no < /tmp/r.json)
+contains "W5 order_no ORD-YYYYMMDD-NNN" "ORD-" "$ORD_A_NO"
+check "W6 status PENDING" "PENDING" "$(jqv status < /tmp/r.json)"
+check "W7 source WHATSAPP" "WHATSAPP" "$(jqv source < /tmp/r.json)"
+check "W8 2 item" "2" "$(jqv item_count < /tmp/r.json)"
+check "W9 1 item unmatch" "1" "$(jqv unmatched_count < /tmp/r.json)"
+check "W10 item match: harga ter-snapshot 25000" "25000" "$(jqv items.0.unit_price < /tmp/r.json)"
+check "W11 item match: matched true" "true" "$(jqv items.0.matched < /tmp/r.json)"
+check "W12 item match: match_score 0.91 tersimpan" "0.91" "$(jqv items.0.match_score < /tmp/r.json)"
+check "W13 item unmatch: product_id kosong" "" "$(jqv items.1.product_id < /tmp/r.json)"
+check "W14 item unmatch: unit_price 0" "0" "$(jqv items.1.unit_price < /tmp/r.json)"
+check "W15 item unmatch: matched false" "false" "$(jqv items.1.matched < /tmp/r.json)"
+check "W16 customer_phone ternormalisasi 62..." "62812" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(String(JSON.parse(s).customer_phone).slice(0,5)))" < /tmp/r.json)"
+check "W17 customer ter-auto-register" "true" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).customer_id>0))" < /tmp/r.json)"
+check "W18 created_by = user sistem bot" "bot" "$(jqv created_by_name < /tmp/r.json)"
+[[ -n "$(jqv raw_message < /tmp/r.json)" ]] && ok "W19 raw_message chat asli tersimpan" "$(jqv raw_message < /tmp/r.json)" || bad "W19 raw_message chat asli tersimpan" "kosong"
+ITEM_A1=$(jqv items.0.id < /tmp/r.json)
+ITEM_A2=$(jqv items.1.id < /tmp/r.json)
+
+step "W) list & filter order book"
+CODE=$(get "$API/order-books?status=PENDING&q=$ORD_A_NO"); check "W20 list filter PENDING+order_no 200" 200 "$CODE"
+check "W21 order ditemukan di list" "$ORD_A" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const a=JSON.parse(s);console.log((a.find(x=>x.order_no==='$ORD_A_NO')||{}).id)})" < /tmp/r.json)"
+CODE=$(get "$API/order-books?q=0812-3456"); check "W22 cari via nomor customer 200" 200 "$CODE"
+CODE=$(get "$API/order-books?date_from=2000-01-01&date_to=2100-01-01&limit=5"); check "W23 filter rentang tanggal 200" 200 "$CODE"
+CODE=$(get "$API/order-books?status=BOGUS"); check "W24 status ngawur -> 400" 400 "$CODE" "$(body)"
+CODE=$(get "$API/order-books/$ORD_A"); check "W25 detail order 200" 200 "$CODE"
+check "W26 detail punya 2 item" "2" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).items.length))" < /tmp/r.json)"
+CODE=$(get "$API/order-books/999999"); check "W27 order tidak ada -> 404" 404 "$CODE" "$(body)"
+contains "W28 code ORDER_NOT_FOUND" "ORDER_NOT_FOUND" "$(jqv code < /tmp/r.json)"
+
+step "W) kasir perbaiki item UNMATCHED (pilih produk -> harga re-snapshot)"
+CODE=$(patch "$API/order-books/$ORD_A/items/$ITEM_A2" "{\"product_id\":$WA_PROD2,\"qty\":5}")
+check "W29 patch item (produk+qty) 200" 200 "$CODE" "$(body)"
+check "W30 unit_price re-snapshot 35000" "35000" "$(jqv items.1.unit_price < /tmp/r.json)"
+check "W31 product_id terisi" "$WA_PROD2" "$(jqv items.1.product_id < /tmp/r.json)"
+check "W32 matched jadi true" "true" "$(jqv items.1.matched < /tmp/r.json)"
+check "W33 qty 5" "5" "$(jqv items.1.qty < /tmp/r.json)"
+check "W34 unmatched_count 0" "0" "$(jqv unmatched_count < /tmp/r.json)"
+check "W35 estimated_total = 30*25000 + 5*35000" "925000" "$(jqv estimated_total < /tmp/r.json)"
+CODE=$(patch "$API/order-books/$ORD_A/items/$ITEM_A1" '{"qty":0}'); check "W36 qty 0 -> 400" 400 "$CODE" "$(body)"
+CODE=$(patch "$API/order-books/$ORD_A/items/999999" '{"qty":2}'); check "W37 patch item tak ada -> 404" 404 "$CODE" "$(body)"
+contains "W38 code ORDER_ITEM_NOT_FOUND" "ORDER_ITEM_NOT_FOUND" "$(jqv code < /tmp/r.json)"
+CODE=$(patch "$API/order-books/$ORD_A/items/$ITEM_A1" '{}'); check "W39 patch tanpa field -> 400" 400 "$CODE" "$(body)"
+
+step "W) hapus item (guard item terakhir)"
+CODE=$(del "$API/order-books/$ORD_A/items/$ITEM_A1"); check "W40 delete item 200" 200 "$CODE" "$(body)"
+check "W41 sisa 1 item" "1" "$(jqv item_count < /tmp/r.json)"
+CODE=$(del "$API/order-books/$ORD_A/items/$ITEM_A2"); check "W42 hapus item terakhir -> 422" 422 "$CODE" "$(body)"
+contains "W43 code ORDER_LAST_ITEM" "ORDER_LAST_ITEM" "$(jqv code < /tmp/r.json)"
+
+step "W) produk nonaktif tidak bisa dipakai di order book"
+CODE=$(patch "$API/products/$WA_PROD2" '{"is_active":false}'); check "W44 nonaktifkan produk 200" 200 "$CODE"
+CODE=$(ipost "$API/order-books" "$IKEY" "{\"customer_phone\":\"0812-3456-$PHONE_TAG\",\"raw_message\":\"uji produk nonaktif\",\"items\":[{\"product_id\":$WA_PROD2,\"product_name\":\"Voucher TLKM\",\"qty\":1}]}")
+check "W45 order pakai produk nonaktif -> 400" 400 "$CODE" "$(body)"
+CODE=$(patch "$API/products/$WA_PROD2" '{"is_active":true}'); check "W46 aktifkan lagi produk 200" 200 "$CODE"
+
+step "W) sale uji untuk convert (1 COMPLETED + 1 VOIDED)"
+CODE=$(post "$API/purchases" "{\"product_id\":$WA_PROD,\"qty\":5,\"unit_cost\":20000}"); check "W47 purchase stok uji 201" 201 "$CODE" "$(body)"
+KEY_W1=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales" "{\"note\":\"WA-0 sale uji #1\",\"items\":[{\"product_id\":$WA_PROD,\"qty\":1,\"unit_price\":25000}],\"payment\":{\"method_id\":$CASH_ID,\"amount\":25000,\"tendered_amount\":25000}}" "$KEY_W1")
+check "W48 sale uji #1 (CASH) 201" 201 "$CODE" "$(body)"
+SALE_W1=$(jqv id < /tmp/r.json)
+check "W49 sale #1 status COMPLETED" "COMPLETED" "$(jqv status < /tmp/r.json)"
+KEY_W2=$(node -e "console.log(require('crypto').randomUUID())")
+CODE=$(post "$API/sales" "{\"note\":\"WA-0 sale uji #2\",\"customer_id\":$CUST_ID,\"items\":[{\"product_id\":$WA_PROD,\"qty\":1,\"unit_price\":25000}]}" "$KEY_W2")
+check "W50 sale uji #2 (UNPAID) 201" 201 "$CODE" "$(body)"
+SALE_W2=$(jqv id < /tmp/r.json)
+CODE=$(post "$API/sales/$SALE_W2/void" '{"reason":"uji guard convert"}'); check "W51 void sale #2 200" 200 "$CODE"
+check "W52 sale #2 jadi VOIDED" "VOIDED" "$(jqv status < /tmp/r.json)"
+
+step "W) convert order -> DONE (dijual via POS normal)"
+CODE=$(post "$API/order-books/$ORD_A/convert" "{\"sale_id\":$SALE_W1}"); check "W53 convert 200" 200 "$CODE" "$(body)"
+check "W54 status DONE" "DONE" "$(jqv status < /tmp/r.json)"
+check "W55 sale_id tertaut" "$SALE_W1" "$(jqv sale_id < /tmp/r.json)"
+contains "W56 sale_no penjualan tampil di detail" "INV-" "$(jqv sale_no < /tmp/r.json)"
+check "W57 processed_by terisi (kasir konversi)" "true" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).processed_by>0))" < /tmp/r.json)"
+CODE=$(get "$API/order-books/$ORD_A"); check "W58 detail setelah convert 200" 200 "$CODE"
+check "W59 sale_no tetap tampil setelah reload" "yes" "$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(/^INV-/.test(JSON.parse(s).sale_no||'')?'yes':'no'))" < /tmp/r.json)"
+
+step "W) guard convert: dobel (idempotent), sale lain, order DONE"
+CODE=$(post "$API/order-books/$ORD_A/convert" "{\"sale_id\":$SALE_W1}"); check "W60 convert ulang sale sama -> 200 idempotent" 200 "$CODE" "$(body)"
+check "W61 status tetap DONE" "DONE" "$(jqv status < /tmp/r.json)"
+check "W62 sale_id tidak berubah" "$SALE_W1" "$(jqv sale_id < /tmp/r.json)"
+# Order DONE sudah terikat sale #1 -> sale lain (walaupun VOIDED) ditolak lebih dulu
+# sebagai "sudah DONE", bukan sebagai "sale tidak valid".
+CODE=$(post "$API/order-books/$ORD_A/convert" "{\"sale_id\":$SALE_W2}"); check "W63 convert order DONE ke sale lain -> 409" 409 "$CODE" "$(body)"
+contains "W64 code ORDER_ALREADY_DONE" "ORDER_ALREADY_DONE" "$(jqv code < /tmp/r.json)"
+CODE=$(patch "$API/order-books/$ORD_A/items/$ITEM_A2" '{"qty":2}'); check "W65 edit item order DONE -> 409" 409 "$CODE" "$(body)"
+contains "W66 code ORDER_STATUS_TRANSITION" "ORDER_STATUS_TRANSITION" "$(jqv code < /tmp/r.json)"
+CODE=$(post "$API/order-books/$ORD_A/status" '{"status":"CANCELLED","reason":"coba batalkan yang sudah jadi"}'); check "W67 batalkan order DONE -> 409" 409 "$CODE" "$(body)"
+
+step "W) order kedua via JWT kasir: PROCESSING lalu CANCELLED (alasan wajib)"
+CODE=$(post "$API/order-books" "{\"customer_phone\":\"0812-9999-$PHONE_TAG\",\"raw_message\":\"minta 1 voucher\",\"items\":[{\"product_id\":$WA_PROD2,\"product_name\":\"Voucher TLKM 40GB\",\"qty\":1}]}")
+check "W68 create order via kasir (JWT) 201" 201 "$CODE" "$(body)"
+ORD_B=$(jqv id < /tmp/r.json)
+check "W69 created_by = kasir (bukan bot)" "kasir1" "$(jqv created_by_name < /tmp/r.json)"
+CODE=$(post "$API/order-books/$ORD_B/status" '{"status":"PROCESSING"}'); check "W70 PENDING -> PROCESSING 200" 200 "$CODE" "$(body)"
+check "W71 status PROCESSING" "PROCESSING" "$(jqv status < /tmp/r.json)"
+CODE=$(post "$API/order-books/$ORD_B/status" '{"status":"PROCESSING"}'); check "W72 PROCESSING -> PROCESSING -> 409" 409 "$CODE" "$(body)"
+CODE=$(post "$API/order-books/$ORD_B/status" '{"status":"CANCELLED"}'); check "W73 CANCELLED tanpa alasan -> 400" 400 "$CODE" "$(body)"
+CODE=$(post "$API/order-books/$ORD_B/status" '{"status":"CANCELLED","reason":"pelanggan berubah pikiran"}'); check "W74 CANCELLED dengan alasan 200" 200 "$CODE" "$(body)"
+check "W75 status CANCELLED" "CANCELLED" "$(jqv status < /tmp/r.json)"
+contains "W76 alasan tersimpan di note" "berubah pikiran" "$(jqv note < /tmp/r.json)"
+CODE=$(post "$API/order-books/$ORD_B/convert" "{\"sale_id\":$SALE_W1}"); check "W77 convert order CANCELLED -> 409" 409 "$CODE" "$(body)"
+CODE=$(post "$API/order-books/$ORD_B/status" '{"status":"CANCELLED","reason":"coba lagi"}'); check "W78 CANCELLED lagi -> 409" 409 "$CODE" "$(body)"
+
+step "W) order ketiga: convert dengan sale yang tidak valid (VOIDED / tidak ada)"
+CODE=$(post "$API/order-books" "{\"customer_phone\":\"0812-7777-$PHONE_TAG\",\"raw_message\":\"cek sale ngawur\",\"items\":[{\"product_name\":\"barang bebas\",\"qty\":2}]}")
+check "W79 create order ke-3 201" 201 "$CODE" "$(body)"
+ORD_C=$(jqv id < /tmp/r.json)
+ITEM_C=$(jqv items.0.id < /tmp/r.json)
+CODE=$(post "$API/order-books/$ORD_C/convert" "{\"sale_id\":$SALE_W2}"); check "W80 convert ke sale VOIDED -> 422" 422 "$CODE" "$(body)"
+contains "W81 code ORDER_CONVERT_INVALID (sale bukan COMPLETED)" "ORDER_CONVERT_INVALID" "$(jqv code < /tmp/r.json)"
+CODE=$(post "$API/order-books/$ORD_C/convert" '{"sale_id":999999}'); check "W80b convert sale tidak ada -> 422" 422 "$CODE" "$(body)"
+contains "W80c code ORDER_CONVERT_INVALID (tidak ditemukan)" "ORDER_CONVERT_INVALID" "$(jqv code < /tmp/r.json)"
+CODE=$(del "$API/order-books/$ORD_C/items/$ITEM_C"); check "W82 hapus item terakhir order #3 -> 422" 422 "$CODE" "$(body)"
+
+step "W) akses: tanpa key/token, key salah, OWNER, validasi body"
+CODE=$(anon "$API/order-books" "$WA_PAYLOAD"); check "W83 tanpa key & tanpa token -> 401" 401 "$CODE" "$(body)"
+CODE=$(badkey "$API/order-books" "$WA_PAYLOAD"); check "W84 key salah -> 401" 401 "$CODE" "$(body)"
+contains "W85 code INTERNAL_KEY_INVALID" "INTERNAL_KEY_INVALID" "$(jqv code < /tmp/r.json)"
+SAVED=$TOKEN; TOKEN=$OWNER_TOKEN
+CODE=$(post "$API/order-books" "$WA_PAYLOAD"); check "W86 OWNER buat order -> 403" 403 "$CODE" "$(body)"
+CODE=$(post "$API/order-books/$ORD_A/status" '{"status":"PROCESSING"}'); check "W87 OWNER ubah status -> 403" 403 "$CODE" "$(body)"
+CODE=$(post "$API/order-books/$ORD_A/convert" "{\"sale_id\":$SALE_W1}"); check "W88 OWNER convert -> 403" 403 "$CODE" "$(body)"
+CODE=$(patch "$API/order-books/$ORD_C/items/$ITEM_C" '{"qty":2}'); check "W89 OWNER patch item -> 403" 403 "$CODE" "$(body)"
+CODE=$(del "$API/order-books/$ORD_C/items/$ITEM_C"); check "W90 OWNER hapus item -> 403" 403 "$CODE" "$(body)"
+CODE=$(get "$API/order-books"); check "W91 OWNER baca list order book 200" 200 "$CODE"
+CODE=$(get "$API/order-books/$ORD_A"); check "W92 OWNER baca detail 200" 200 "$CODE"
+TOKEN=$SAVED
+CODE=$(ipost "$API/order-books" "$IKEY" '{"customer_phone":"0812-1111","raw_message":"x","items":[]}'); check "W93 items kosong -> 400" 400 "$CODE" "$(body)"
+CODE=$(ipost "$API/order-books" "$IKEY" '{"raw_message":"tanpa nomor","items":[{"product_name":"x","qty":1}]}'); check "W94 tanpa customer_phone -> 400" 400 "$CODE" "$(body)"
+CODE=$(ipost "$API/order-books" "$IKEY" '{"customer_phone":"0812-1111","raw_message":"qty ngawur","items":[{"product_name":"x","qty":-3}]}'); check "W95 qty negatif -> 400" 400 "$CODE" "$(body)"
+
 hr "Pembersihan data uji"
 step "nonaktifkan produk uji (soft delete) + nonaktifkan metode uji"
-for PID in $GULA_ID $VOUCHER_ID $PROD_RBAC; do
+for PID in $GULA_ID $VOUCHER_ID $PROD_RBAC $WA_PROD $WA_PROD2; do
   CODE=$(curl -s -o /tmp/r.json -w '%{http_code}' -X DELETE "$API/products/$PID" -H "Authorization: Bearer $TOKEN")
   check "c1x produk $PID nonaktif" 200 "$CODE" "$(body)"
 done
@@ -537,10 +718,11 @@ step "verifikasi data asli tidak berubah oleh e2e ini (produk produksi id=1)"
 # berubah kalau ada klien lain (mis. POS sungguhan) memakai produk yang sama.
 CODE=$(get "$API/stock?product_id=1"); P1_AFTER=$(jqv 0.qty_on_hand < /tmp/r.json)
 check "c3x stok produk id=1 tidak berubah oleh e2e" "$P1_BEFORE" "$P1_AFTER" "sebelum=$P1_BEFORE sesudah=$P1_AFTER"
-# Batch GRN-20261004-001 searched by code (bukan index 0) supaya tahan batch lain.
+# Batch produksi yang direkam di awal skrip searched by code (bukan index 0) supaya tahan
+# batch lain yang mungkin muncul di tengah jalan.
 CODE=$(get "$API/purchases?product_id=1")
-B1_AFTER=$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const a=JSON.parse(s).filter(x=>x.batch_code==='GRN-20261004-001');console.log(a.length?a[0].qty_remaining:'tidak-ada')})" < /tmp/r.json)
-[[ -n "$B1_AFTER" && "$B1_AFTER" != "tidak-ada" ]] && ok "c4x batch GRN-20261004-001 masih ada" "qty_remaining=$B1_AFTER" || bad "c4x batch GRN-20261004-001" "tidak ditemukan"
+B1_AFTER=$(node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const a=JSON.parse(s).filter(x=>x.batch_code==='$P1_BATCH_CODE');console.log(a.length?a[0].qty_remaining:'tidak-ada')})" < /tmp/r.json)
+[[ -n "$B1_AFTER" && "$B1_AFTER" != "tidak-ada" ]] && ok "c4x batch produksi lama $P1_BATCH_CODE masih ada" "qty_remaining=$B1_AFTER" || bad "c4x batch produksi lama masih ada" "$P1_BATCH_CODE tidak ditemukan"
 
 step "jalankan mark-test-data (tandai sale + opex uji agar tidak masuk laporan)"
 if command -v npx >/dev/null 2>&1 && [[ -f scripts/mark-test-data.ts ]]; then
@@ -555,4 +737,5 @@ hr "RINGKASAN"
 printf '  PASS: %d   FAIL: %d\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then printf '\n  Gagal:\n'; for f in "${FAILED[@]}"; do printf '   - %s\n' "$f"; done; exit 1; fi
 printf '\n  Semua uji lulus.\n'
-printf '  Data uji tersisa: produk id=%s,%s,%s (nonaktif), sale id=%s,%s,%s,%s,%s,%s (tidak bisa di-DELETE).\n' "$GULA_ID" "$VOUCHER_ID" "$PROD_RBAC" "$SALE_C" "$SALE_D" "$SALE_V" "$ID1" "$SALE_A" "$SALE_C2"
+printf '  Data uji tersisa: produk id=%s,%s,%s,%s,%s (nonaktif), sale id=%s,%s,%s,%s,%s,%s,%s,%s (tidak bisa di-DELETE).\n' "$GULA_ID" "$VOUCHER_ID" "$PROD_RBAC" "$WA_PROD" "$WA_PROD2" "$SALE_C" "$SALE_D" "$SALE_V" "$ID1" "$SALE_A" "$SALE_C2" "$SALE_W1" "$SALE_W2"
+printf '  Order book uji (tidak bisa di-DELETE): %s %s %s (DONE / CANCELLED / PENDING)\n' "$ORD_A_NO" "$ORD_B" "$ORD_C"

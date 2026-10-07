@@ -10,6 +10,7 @@ const PREFIX: Record<string, string> = {
   batch: 'GRN',
   opname: 'OPN',
   supplierReturn: 'RTR',
+  order: 'ORD',
 };
 
 const SEQ: Record<string, string> = {
@@ -17,6 +18,7 @@ const SEQ: Record<string, string> = {
   batch: 'public.batch_code_seq',
   opname: 'public.opname_no_seq',
   supplierReturn: 'public.supplier_return_no_seq',
+  order: 'public.order_no_seq',
 };
 
 export async function nextDocNo(client: PoolClient, kind: keyof typeof PREFIX, businessTz: string): Promise<string> {

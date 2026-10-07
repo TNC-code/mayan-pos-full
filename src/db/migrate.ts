@@ -1,3 +1,6 @@
+import { randomBytes } from 'node:crypto';
+import bcrypt from 'bcrypt';
+import type { PoolClient } from 'pg';
 import { pool, closePool, withTransaction } from '../config/db.js';
 import { env } from '../config/env.js';
 
@@ -361,7 +364,96 @@ CREATE INDEX IF NOT EXISTS idx_supplier_returns_is_test
   WHERE is_test = false AND status = 'REFUNDED';
 `;
 
-export async function migrate(): Promise<void> {
+const MIGRATION_NAME_9 = '0009_order_books';
+
+const DDL9 = `
+-- 1) Penomoran order book (ORD-YYYYMMDD-NNN) dari SEQUENCE, sama seperti
+--    sale_no/batch_code/opname_no/supplier return_no.
+CREATE SEQUENCE IF NOT EXISTS public.order_no_seq AS bigint START WITH 1 INCREMENT BY 1;
+
+-- 2) Order book = DRAFT pesanan dari chat WhatsApp. TIDAK menyentuh stok/ledger;
+--    kasir yang memprosesnya jadi penjualan biasa lewat POST /order-books/{id}/convert.
+--    order_no NOT NULL karena selalu digenerate nextDocNo() saat insert.
+CREATE TABLE IF NOT EXISTS public.order_books (
+    id            bigserial     PRIMARY KEY,
+    order_no      text          NOT NULL UNIQUE,
+    status        varchar(12)   NOT NULL DEFAULT 'PENDING',
+    source        varchar(10)   NOT NULL DEFAULT 'WHATSAPP',
+    customer_id   integer       REFERENCES public.customer(id),
+    customer_name text,
+    customer_phone text,
+    raw_message   text,                        -- chat asli (audit/AI)
+    note          text,
+    sale_id       bigint        REFERENCES public.sales(id),
+    created_by    integer       REFERENCES public.user_account(id),   -- akun sistem 'bot'
+    processed_by  integer       REFERENCES public.user_account(id),   -- kasir yang memproses
+    created_at    timestamptz   NOT NULL DEFAULT now(),
+    updated_at    timestamptz   NOT NULL DEFAULT now(),
+    CONSTRAINT chk_order_book_status CHECK (status IN ('PENDING','PROCESSING','DONE','CANCELLED'))
+);
+-- Index utama: daftar kasir = filter status, urut dari yang terbaru.
+CREATE INDEX IF NOT EXISTS idx_order_books_status_created ON public.order_books (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_order_books_customer     ON public.order_books (customer_id);
+CREATE INDEX IF NOT EXISTS idx_order_books_sale         ON public.order_books (sale_id);
+
+-- 3) Item order book. product_id NULLABLE = UNMATCHED (kasir wajib pilih produk
+--    sebelum order bisa di-convert). unit_price 0 selama belum match.
+CREATE TABLE IF NOT EXISTS public.order_book_items (
+    id           bigserial     PRIMARY KEY,
+    order_book_id bigint       NOT NULL REFERENCES public.order_books(id) ON DELETE RESTRICT,
+    product_id   integer       REFERENCES public.product(id),
+    product_name text          NOT NULL,
+    raw_text     text,
+    qty          numeric(14,3) NOT NULL CHECK (qty > 0),
+    unit_price   numeric(14,2) NOT NULL DEFAULT 0,
+    matched      boolean       NOT NULL DEFAULT false,
+    match_score  numeric(4,3),
+    CONSTRAINT chk_order_item_price_nonneg CHECK (unit_price >= 0),
+    CONSTRAINT chk_order_item_match_score  CHECK (match_score IS NULL OR (match_score >= 0 AND match_score <= 1))
+);
+CREATE INDEX IF NOT EXISTS idx_order_book_items_order   ON public.order_book_items (order_book_id);
+CREATE INDEX IF NOT EXISTS idx_order_book_items_product ON public.order_book_items (product_id);
+`;
+
+/**
+ * Akun sistem `bot` = akun audit untuk order book yang dibuat lewat X-Internal-Key.
+ *
+ * - `is_active = false` -> `login()` menolak sebelum cek password, jadi akun ini
+ *   praktis tidak bisa dipakai masuk secara interaktif.
+ * - Password = 48 karakter RANDOM yang dicoba sekali lalu TIDAK dicatat di mana pun
+ *   (tidak ada di .env, tidak ada di log, tidak ada di repo) -> tidak ada yang bisa login.
+ * - Idempotent: user_account baseline TIDAK punya UNIQUE(username), jadi `ON CONFLICT`
+ *   tidak bisa dipakai (seed.ts punya catatan yang sama). Pola `INSERT ... WHERE NOT EXISTS`
+ *   dipakai supaya hash tidak di-regenerasi pada setiap `npm run migrate`.
+ */
+async function ensureBotUser(client: PoolClient): Promise<number> {
+  const existing = await client.query<{ id: number }>(
+    `SELECT id FROM public.user_account WHERE lower(username) = 'bot' ORDER BY id LIMIT 1`,
+  );
+  if (existing.rows[0]) return existing.rows[0].id;
+
+  // 36 byte -> 48 karakter base64url; hanya dipakai sekali (tidak pernah ditampilkan).
+  const randomPassword = randomBytes(36).toString('base64url');
+  const hash = await bcrypt.hash(randomPassword, env.bcryptRounds);
+  const ins = await client.query<{ id: number }>(
+    `INSERT INTO public.user_account (username, password, full_name, phone, is_active, role)
+     SELECT 'bot', $1, 'Bot Order WhatsApp', NULL, false, 'KASIR'
+      WHERE NOT EXISTS (SELECT 1 FROM public.user_account WHERE lower(username) = 'bot')
+     RETURNING id`,
+    [hash],
+  );
+  if (ins.rows[0]) return ins.rows[0].id;
+
+  // Balapan dengan proses migrate lain: ambil id yang baru dibuat proses tsb.
+  const again = await client.query<{ id: number }>(
+    `SELECT id FROM public.user_account WHERE lower(username) = 'bot' ORDER BY id LIMIT 1`,
+  );
+  if (!again.rows[0]) throw new Error('Gagal membuat user sistem bot');
+  return again.rows[0].id;
+}
+
+export async function migrate(): Promise<number> {
+  let botUserId = 0;
   await withTransaction(async (client) => {
     await client.query(DDL);
     await client.query(DDL2);
@@ -371,6 +463,7 @@ export async function migrate(): Promise<void> {
     await client.query(DDL6);
     await client.query(DDL7);
     await client.query(DDL8);
+    await client.query(DDL9);
 
     // P0: sinkronkan role OWNER awal dari konfigurasi .env ke kolom DB.
     const owners = [...env.roles.owner, ...[]].filter(Boolean);
@@ -398,12 +491,23 @@ export async function migrate(): Promise<void> {
         FROM public.stock_opnames
        WHERE opname_no ~ '^[A-Z]+-[0-9]{8}-[0-9]+$'
     `);
+    const orders = await client.query<{ next: number }>(`
+      SELECT COALESCE(MAX(NULLIF(regexp_replace(order_no, '^.*-', ''), '')::int), 0) + 1 AS next
+        FROM public.order_books
+       WHERE order_no ~ '^[A-Z]+-[0-9]{8}-[0-9]+$'
+    `);
 
     // is_called = false -> nextval() berikutnya mengembalikan tepat nilai `next`
     await client.query('SELECT setval($1, $2, false)', ['public.sale_no_seq', sales.rows[0]?.next ?? 1]);
     await client.query('SELECT setval($1, $2, false)', ['public.batch_code_seq', batches.rows[0]?.next ?? 1]);
     await client.query('SELECT setval($1, $2, false)', ['public.opname_no_seq', opnames.rows[0]?.next ?? 1]);
+    await client.query('SELECT setval($1, $2, false)', ['public.order_no_seq', orders.rows[0]?.next ?? 1]);
+
+    // Akun sistem untuk order book dari bot WA (audit created_by).
+    botUserId = await ensureBotUser(client);
   });
+
+  return botUserId;
 }
 
 /**
@@ -476,7 +580,7 @@ if (isMain) {
       }
       console.log(`[migrate] baseline schema final terdeteksi (${REQUIRED_TABLES.length} tabel, ${REQUIRED_TRIGGERS.length} trigger)`);
 
-      await migrate();
+      const botId = await migrate();
       console.log(`[migrate] OK - ${MIGRATION_NAME}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_2}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_3}`);
@@ -485,6 +589,8 @@ if (isMain) {
       console.log(`[migrate] OK - ${MIGRATION_NAME_6}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_7}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_8}`);
+      console.log(`[migrate] OK - ${MIGRATION_NAME_9}`);
+      console.log(`[migrate] user sistem bot (order book WA): id=${botId} (is_active=false, tidak bisa login)`);
 
       const res = await pool.query<{ server_version: string; db_now: Date; db_tz: string }>(
         `SELECT current_setting('server_version') AS server_version, now() AS db_now, current_setting('TimeZone') AS db_tz`,

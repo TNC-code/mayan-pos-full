@@ -16,6 +16,8 @@ declare global {
     interface Request {
       user?: AuthUser;
       idempotencyKey?: string;
+      /** true bila request tervalidasi lewat header X-Internal-Key (lihat internal-key.ts). */
+      internalCaller?: boolean;
     }
   }
 }

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { asyncHandler as h, validateBody as vBody, validateQuery as vQuery } from '../middleware/validate.js';
 import { requireAuth, requireRole, requireIdempotencyKey } from '../middleware/auth.js';
+import { requireInternalKey, requireInternalKeyOrKasir } from '../middleware/internal-key.js';
 import { rateLimit } from '../middleware/rate-limit.js';
 import * as authCtrl from '../controllers/auth.controller.js';
 import * as masterCtrl from '../controllers/master.controller.js';
@@ -12,6 +13,8 @@ import * as opnameCtrl from '../controllers/opname.controller.js';
 import * as expenseCtrl from '../controllers/expense.controller.js';
 import * as cashCtrl from '../controllers/cash-session.controller.js';
 import * as storeCtrl from '../controllers/store.controller.js';
+import * as orderBookCtrl from '../controllers/order-book.controller.js';
+import * as internalCatalogCtrl from '../controllers/internal-catalog.controller.js';
 import * as S from '../controllers/schemas.js';
 
 /**
@@ -38,6 +41,17 @@ export function buildRouter(): Router {
   // Satu-satunya endpoint publik (semua endpoint lain wajib token).
   r.post('/auth/login', rateLimit('login', { windowMs: 15 * 60_000, max: 10 }), vBody(S.loginSchema), h(authCtrl.login));
   r.post('/auth/refresh', rateLimit('refresh', { windowMs: 15 * 60_000, max: 30 }), vBody(S.refreshTokenSchema), h(authCtrl.refresh));
+
+  /* ------------------- order books (bot WA) - jalur auth ganda ------------------- */
+  // POST /order-books HARUS didaftarkan SEBELUM `r.use(requireAuth)` di bawah: endpoint ini
+  // punya dua jalur auth - header `X-Internal-Key` (bot WhatsApp) ATAU login kasir.
+  // Middleware requireInternalKeyOrKasir() yang menentukannya (lihat middleware/internal-key.ts).
+  r.post('/order-books', requireInternalKeyOrKasir(), vBody(S.orderBookCreateSchema), h(orderBookCtrl.createOrderBook));
+
+  /* ------------------- katalog internal (bot WA, WA-1) ------------------- */
+  // Bot matcher butuh daftar produk + stok, tapi tidak punya JWT kasir -> endpoint ini
+  // HANYA menerima `X-Internal-Key` (tidak dibuka ke sesi kasir) dan tidak mengirim harga beli.
+  r.get('/internal/catalog', requireInternalKey, h(internalCatalogCtrl.getCatalog));
 
   r.use(requireAuth);
   r.get('/auth/me', h(authCtrl.me));
@@ -129,6 +143,17 @@ export function buildRouter(): Router {
   // Profil toko: semua role boleh baca (dipakai header nota kasir), hanya kasir boleh ubah.
   r.get('/store', h(storeCtrl.getStore));
   r.patch('/store', KASIR, vBody(S.storeUpdateSchema), h(storeCtrl.updateStore));
+
+  /* ----------------------------- order books ----------------------------- */
+  // Daftar/detail dibuka semua role (dipakai layar kasir "Order WA");
+  // mutasi item/status/convert = KASIR. POST-nya sudah didaftarkan di atas
+  // (butuh jalur auth ganda: internal key ATAU kasir).
+  r.get('/order-books', vQuery(S.orderBookListSchema), h(orderBookCtrl.listOrderBooks));
+  r.get('/order-books/:id', h(orderBookCtrl.getOrderBook));
+  r.patch('/order-books/:id/items/:itemId', KASIR, vBody(S.orderBookItemPatchSchema), h(orderBookCtrl.patchOrderBookItem));
+  r.delete('/order-books/:id/items/:itemId', KASIR, h(orderBookCtrl.deleteOrderBookItem));
+  r.post('/order-books/:id/status', KASIR, vBody(S.orderBookStatusSchema), h(orderBookCtrl.setOrderBookStatus));
+  r.post('/order-books/:id/convert', KASIR, vBody(S.orderBookConvertSchema), h(orderBookCtrl.convertOrderBook));
 
   return r;
 }
