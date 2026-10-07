@@ -1408,6 +1408,8 @@ components:
         barcode: { type: string, nullable: true }
         name: { type: string }
         unit: { type: string, example: pcs }
+        category_id: { type: integer, nullable: true, description: 'FK product_category; null = tanpa kategori' }
+        category_name: { type: string, nullable: true, description: 'nama kategori (LEFT JOIN, siap tampil tanpa lookup ulang)' }
         harga_beli: { type: number, format: float, example: 40000.00 }
         harga_jual: { type: number, format: float, example: 55000.00 }
         attributes:
