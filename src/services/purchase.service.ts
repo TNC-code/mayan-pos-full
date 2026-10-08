@@ -13,6 +13,11 @@ export interface BatchRow {
   qty_received: number;
   qty_remaining: number;
   unit_cost: number;
+  /** Mode markup harga jual usulan: AMOUNT (Rp/pcs) | PERCENT (%) | NULL (batch lama). */
+  markup_type: 'AMOUNT' | 'PERCENT' | null;
+  markup_value: number;
+  /** Generated column DB: harga jual usulan batch ini (req #4: harga beli + markup). */
+  suggested_price: number;
   expired_date: string | null;
   supplier: string | null;
   note: string | null;
@@ -23,7 +28,9 @@ export interface BatchRow {
 
 const SELECT_BATCH = `
   SELECT b.id, b.batch_code, b.product_id, p.name AS product_name, p.unit,
-         b.qty_received, b.qty_remaining, b.unit_cost, b.expired_date, b.supplier, b.note,
+         b.qty_received, b.qty_remaining, b.unit_cost,
+         b.markup_type, b.markup_value, b.suggested_price,
+         b.expired_date, b.supplier, b.note,
          b.received_at, b.created_by, u.username AS created_by_name
     FROM stock_batches b
     JOIN product p ON p.id = b.product_id
@@ -72,6 +79,8 @@ export interface PurchaseInput {
   product_id: number;
   qty: number;
   unit_cost: number;
+  markup_type: 'AMOUNT' | 'PERCENT';
+  markup_value: number;
   expired_date?: string | null;
   supplier?: string | null;
   notes?: string | null;
@@ -82,7 +91,8 @@ export interface PurchaseInput {
  * `qty_remaining` tidak dihitung aplikasi; trigger trg_stock_movement_apply yang
  * menambahkannya dari qty_change movement.
  * Side effect DB: trg_batch_update_product_cost menyelaraskan product.harga_beli
- * dengan unit_cost batch terbaru.
+ * dengan unit_cost batch terbaru, dan (sejak 0010) product.harga_jual dengan
+ * suggested_price batch (markup AMOUNT/PERCENT — baruplan.md req #3-4).
  */
 export async function createPurchase(input: PurchaseInput, createdBy: number | null): Promise<BatchRow> {
   return withTx(async (client) => {
@@ -98,10 +108,22 @@ export async function createPurchase(input: PurchaseInput, createdBy: number | n
 
     const inserted = await client.query<{ id: number }>(
       `INSERT INTO stock_batches
-         (batch_code, product_id, qty_received, qty_remaining, unit_cost, expired_date, supplier, note, created_by)
-       VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8)
+         (batch_code, product_id, qty_received, qty_remaining, unit_cost,
+          markup_type, markup_value, expired_date, supplier, note, created_by)
+       VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
-      [batchCode, input.product_id, input.qty, input.unit_cost, input.expired_date ?? null, input.supplier ?? null, input.notes ?? null, createdBy],
+      [
+        batchCode,
+        input.product_id,
+        input.qty,
+        input.unit_cost,
+        input.markup_type,
+        input.markup_value,
+        input.expired_date ?? null,
+        input.supplier ?? null,
+        input.notes ?? null,
+        createdBy,
+      ],
     );
     const batchId = inserted.rows[0]!.id;
 
@@ -123,4 +145,35 @@ export async function createPurchase(input: PurchaseInput, createdBy: number | n
 
     return getBatch(batchId, client);
   }, 'purchase');
+}
+
+/* ================= picker batch layar kasir (baruplan.md req #1) ================= */
+
+/**
+ * Daftar batch SATU produk untuk modal "Detail Item" di POS: kasir melihat tiap
+ * batch punya sisa stok (qty_remaining), harga beli (unit_cost — floor nego), dan
+ * harga jual usulan (suggested_price dari markup batch). Urutan FIFO dengan
+ * expired NULLS LAST (sama dengan auto-FIFO resolveBatchId di sale.service).
+ */
+export async function listProductBatches(
+  productId: number,
+  availableOnly: boolean,
+): Promise<BatchRow[]> {
+  const product = await pool.query<{ id: number }>(`SELECT id FROM product WHERE id = $1`, [productId]);
+  if (!product.rows[0]) {
+    throw new ApiError('NOT_FOUND', `Produk id=${productId} tidak ditemukan`);
+  }
+
+  const args: unknown[] = [productId];
+  const where = ['b.product_id = $1'];
+  if (availableOnly) where.push('b.qty_remaining > 0');
+  args.push(200);
+
+  const res = await pool.query<BatchRow>(
+    `${SELECT_BATCH} WHERE ${where.join(' AND ')}
+     ORDER BY b.expired_date ASC NULLS LAST, b.id ASC
+     LIMIT $2`,
+    args as never[],
+  );
+  return res.rows;
 }

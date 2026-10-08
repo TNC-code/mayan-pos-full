@@ -416,6 +416,67 @@ CREATE INDEX IF NOT EXISTS idx_order_book_items_product ON public.order_book_ite
 `;
 
 /**
+ * MIGRATION 0010 — batch costing: markup harga jual per batch (baruplan.md).
+ *
+ * Requirement:
+ *  - Input stok wajib punya harga beli + harga jual (req #3). Harga beli sudah ada
+ *    sejak baseline (stock_batches.unit_cost). Yang ditambahkan: markup harga jual
+ *    per batch, dua mode: AMOUNT (Rp/pcs) atau PERCENT (%).
+ *  - Contoh req #4: beli 12.500 + markup AMOUNT 1.000 -> harga jual 13.500.
+ *
+ * `suggested_price` = generated column (selalu konsisten dengan unit_cost + markup):
+ *    AMOUNT  : unit_cost + markup_value
+ *    PERCENT : unit_cost * (1 + markup_value/100)
+ *    NULL    : unit_cost (batch lama sebelum fitur ini -> tidak berubah)
+ *
+ * Trigger fn_batch_update_product_cost diperluas: batch BARU juga menyelaraskan
+ * product.harga_jual dengan suggested_price batch tersebut (pola sama dengan
+ * harga_beli). Batch lama (markup_type IS NULL) tidak pernah menimpa harga jual.
+ */
+const MIGRATION_NAME_10 = '0010_batch_markup_suggested_price';
+
+const DDL10 = `
+ALTER TABLE public.stock_batches
+  ADD COLUMN IF NOT EXISTS markup_type  varchar(10),
+  ADD COLUMN IF NOT EXISTS markup_value numeric(14,2) NOT NULL DEFAULT 0;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_batch_markup_type') THEN
+    ALTER TABLE public.stock_batches
+      ADD CONSTRAINT chk_batch_markup_type
+      CHECK (markup_type IS NULL OR markup_type IN ('AMOUNT','PERCENT'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_batch_markup_value') THEN
+    ALTER TABLE public.stock_batches
+      ADD CONSTRAINT chk_batch_markup_value CHECK (markup_value >= 0);
+  END IF;
+END $$;
+
+ALTER TABLE public.stock_batches
+  ADD COLUMN IF NOT EXISTS suggested_price numeric(14,2)
+  GENERATED ALWAYS AS (
+    CASE markup_type
+      WHEN 'AMOUNT'  THEN round(unit_cost + markup_value, 2)
+      WHEN 'PERCENT' THEN round(unit_cost * (1 + markup_value / 100.0), 2)
+      ELSE unit_cost
+    END
+  ) STORED;
+
+-- Batch baru menyelaraskan harga jual produk dengan harga jual usulan batch tsb.
+-- COALESCE menjaga batch lama (markup NULL -> suggested_price = unit_cost) agar
+-- tidak menimpa harga_jual produk yang sudah diisi manual sebelum fitur ini.
+CREATE OR REPLACE FUNCTION public.fn_batch_update_product_cost() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE product
+       SET harga_beli = NEW.unit_cost,
+           harga_jual = CASE WHEN NEW.markup_type IS NULL THEN product.harga_jual
+                             ELSE NEW.suggested_price END,
+           updated_at = now()
+     WHERE id = NEW.product_id;
+    RETURN NEW;
+END $$;
+`;
+
+/**
  * Akun sistem `bot` = akun audit untuk order book yang dibuat lewat X-Internal-Key.
  *
  * - `is_active = false` -> `login()` menolak sebelum cek password, jadi akun ini
@@ -464,6 +525,7 @@ export async function migrate(): Promise<number> {
     await client.query(DDL7);
     await client.query(DDL8);
     await client.query(DDL9);
+    await client.query(DDL10);
 
     // P0: sinkronkan role OWNER awal dari konfigurasi .env ke kolom DB.
     const owners = [...env.roles.owner, ...[]].filter(Boolean);
@@ -590,6 +652,7 @@ if (isMain) {
       console.log(`[migrate] OK - ${MIGRATION_NAME_7}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_8}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_9}`);
+      console.log(`[migrate] OK - ${MIGRATION_NAME_10}`);
       console.log(`[migrate] user sistem bot (order book WA): id=${botId} (is_active=false, tidak bisa login)`);
 
       const res = await pool.query<{ server_version: string; db_now: Date; db_tz: string }>(

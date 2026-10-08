@@ -14,7 +14,8 @@
     "e2e": "bash scripts/e2e.sh",
     "concurrency": "tsx scripts/concurrency.ts",
     "mark-test-data": "tsx scripts/mark-test-data.ts",
-    "backup": "bash scripts/backup.sh"
+    "backup": "bash scripts/backup.sh",
+    "e2e:batch": "tsx scripts/e2e_batch_nego.ts"
   },
   "engines": {
     "node": ">=26"

@@ -490,6 +490,28 @@ paths:
               schema: { $ref: '#/components/schemas/StockBatch' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /products/{id}/batches:
+    get:
+      tags: [Purchases]
+      summary: Picker batch satu produk untuk layar kasir (baruplan #1)
+      description: |
+        Daftar batch milik satu produk dengan sisa stok, harga beli (floor nego) dan
+        harga jual usulan (suggested_price). Dipakai modal "Detail Item" kasir untuk
+        memilih batch saat produk sama datang dari vendor berbeda dengan harga beda.
+        Urutan FIFO: `expired_date NULLS LAST, id ASC` — sama dengan auto-FIFO `POST /sales`.
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: available_only, in: query, schema: { type: boolean, default: true }, description: 'hanya batch dengan qty_remaining > 0' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/StockBatch' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /sales:
     get:
       tags: [Sales]
@@ -1713,16 +1735,32 @@ components:
         qty_remaining: { type: number, example: 16.000 }
         qty_damaged: { type: number, example: 2.000, description: 'barang rusak karantina pada batch ini' }
         unit_cost: { type: number, format: float, example: 40000.00 }
+        markup_type:
+          type: string
+          nullable: true
+          enum: [AMOUNT, PERCENT, null]
+          description: 'mode markup harga jual usulan (0010); NULL = batch lama sebelum fitur'
+        markup_value: { type: number, format: float, example: 1000.00 }
+        suggested_price:
+          type: number
+          format: float
+          example: 13500.00
+          description: 'harga jual usulan dari batch ini (generated): AMOUNT = unit_cost + markup_value, PERCENT = unit_cost × (1 + markup_value/100); batch lama = unit_cost'
         expired_date: { type: string, format: date, nullable: true }
         supplier: { type: string, nullable: true }
 
     PurchaseInput:
       type: object
-      required: [product_id, qty, unit_cost]
+      required: [product_id, qty, unit_cost, markup_type, markup_value]
       properties:
         product_id: { type: integer }
         qty: { type: number, example: 20 }
         unit_cost: { type: number, format: float, example: 40000.00 }
+        markup_type:
+          type: string
+          enum: [AMOUNT, PERCENT]
+          description: 'AMOUNT = markup Rp/satuan; PERCENT = markup % dari harga beli (wajib — req baruplan #3)'
+        markup_value: { type: number, format: float, example: 1000.00, description: 'nilai markup (>= 0; 0 = jual netral di harga beli)' }
         expired_date: { type: string, format: date, nullable: true }
         supplier: { type: string }
         notes: { type: string }

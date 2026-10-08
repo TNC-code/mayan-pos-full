@@ -90,6 +90,10 @@ export function buildRouter(): Router {
   r.get('/purchases/batches/:id', h(stockCtrl.getBatch));
 
   /* ------------------------------- stock ------------------------------ */
+  // Picker batch per produk untuk layar kasir (baruplan.md req #1).
+  r.get('/products/:id/batches', vQuery(S.productBatchListSchema), h(stockCtrl.listProductBatches));
+
+  /* ------------------------------- stock ------------------------------ */
   r.get('/stock', vQuery(S.stockListSchema), h(stockCtrl.listStock));
   r.get('/stock/movements', vQuery(S.movementListSchema), h(stockCtrl.listMovements));
   r.get('/stock/products/:id', h(stockCtrl.getProductStock));

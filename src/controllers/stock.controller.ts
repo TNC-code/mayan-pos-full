@@ -21,6 +21,12 @@ export async function getBatch(req: Request, res: Response): Promise<void> {
   res.status(200).json(await purchaseService.getBatch(asInt(req.params.id!, 'id')));
 }
 
+/** Picker batch layar kasir: `GET /products/{id}/batches` (baruplan.md req #1). */
+export async function listProductBatches(req: Request, res: Response): Promise<void> {
+  const q = validated<{ available_only: boolean }>(res);
+  res.status(200).json(await purchaseService.listProductBatches(asInt(req.params.id!, 'id'), q.available_only));
+}
+
 /* ------------------------------- stock ------------------------------- */
 export async function listStock(_req: Request, res: Response): Promise<void> {
   const q = validated<{

@@ -106,10 +106,18 @@ export const customerListSchema = z.object({
 });
 
 /* ---------------------------- purchases ---------------------------- */
+/**
+ * Markup harga jual batch (baruplan.md req #3-4): wajib diisi agar setiap batch
+ * selalu punya harga jual usulan — AMOUNT = tambahan Rp/pcs (12.500 + 1.000 =
+ * 13.500), PERCENT = persentase dari harga beli (12.500 + 10% = 13.750).
+ * markup_value 0 sah (jual netral di harga beli).
+ */
 export const purchaseSchema = z.object({
   product_id: id,
   qty,
   unit_cost: money,
+  markup_type: z.enum(['AMOUNT', 'PERCENT']),
+  markup_value: money,
   expired_date: dateStr.nullish(),
   supplier: z.string().trim().max(128).nullish(),
   notes: z.string().trim().max(500).nullish(),
@@ -121,6 +129,11 @@ export const purchaseListSchema = z.object({
   active_only: boolish,
   limit: z.coerce.number().int().min(1).max(200).default(50),
   offset: z.coerce.number().int().min(0).default(0),
+});
+
+/** Picker batch layar kasir: `GET /products/{id}/batches` (req #1 — pilih batch di POS). */
+export const productBatchListSchema = z.object({
+  available_only: boolish.default(true),
 });
 
 /* ------------------------------ sales ------------------------------ */
