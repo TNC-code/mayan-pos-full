@@ -111,6 +111,13 @@ export const customerListSchema = z.object({
  * selalu punya harga jual usulan — AMOUNT = tambahan Rp/pcs (12.500 + 1.000 =
  * 13.500), PERCENT = persentase dari harga beli (12.500 + 10% = 13.750).
  * markup_value 0 sah (jual netral di harga beli).
+ *
+ * `merge_into_batch_id` (opsional) = top-up stok ke batch yang SUDAH ADA
+ * (barang susulan dari PO yang sama). Syarat di server:
+ *  - produk harus sama dengan batch tujuan;
+ *  - `unit_cost` harus IDENTIK dengan batch tujuan (beda harga = paksa batch
+ *    baru agar harga beli per batch tetap murni);
+ *  - pricing (markup) mengikuti batch tujuan — field markup diabaikan.
  */
 export const purchaseSchema = z.object({
   product_id: id,
@@ -121,7 +128,40 @@ export const purchaseSchema = z.object({
   expired_date: dateStr.nullish(),
   supplier: z.string().trim().max(128).nullish(),
   notes: z.string().trim().max(500).nullish(),
+  merge_into_batch_id: id.nullish(),
 });
+
+/**
+ * Koreksi salah input barang masuk — `PATCH /purchases/batches/{id}`.
+ *
+ * Semua field opsional; minimal satu yang dikirim. Guard di server:
+ *  - batch belum boleh punya mutasi keluar (belum terjual/retur/opname) —
+ *    kalau sudah, koreksi harus lewat opname/retur supaya jejak nyata;
+ *  - qty baru >= 1 dan tidak boleh di bawah sisa stok (qty_remaining);
+ *  - `batch_code` & `product_id` TIDAK bisa diubah (terkunci).
+ * Perubahan qty dicatat sebagai movement ADJUSTMENT (ledger tetap utuh).
+ */
+export const batchUpdateSchema = z
+  .object({
+    qty: qty.nullish(),
+    unit_cost: money.nullish(),
+    markup_type: z.enum(['AMOUNT', 'PERCENT']).nullish(),
+    markup_value: money.nullish(),
+    expired_date: dateStr.nullish(),
+    supplier: z.string().trim().max(128).nullish(),
+    notes: z.string().trim().max(500).nullish(),
+  })
+  .refine(
+    (val) =>
+      val.qty != null ||
+      val.unit_cost != null ||
+      val.markup_type != null ||
+      val.markup_value != null ||
+      val.expired_date !== undefined ||
+      val.supplier !== undefined ||
+      val.notes !== undefined,
+    { message: 'Minimal satu field yang diubah (qty, harga beli, markup, expired, supplier, atau catatan)' },
+  );
 
 export const purchaseListSchema = z.object({
   product_id: z.coerce.number().int().positive().optional(),

@@ -477,6 +477,51 @@ END $$;
 `;
 
 /**
+ * MIGRATION 0011 — edit & top-up barang masuk (baruplan: koreksi salah input).
+ *
+ * Trigger fn_batch_update_product_cost diperluas agar juga berjalan pada UPDATE
+ * kolom harga batch (fitur `PATCH /purchases/batches/{id}`):
+ *  - Perbaikan unit_cost / markup pada batch TERBARU → harga_beli/harga_jual
+ *    produk ikut terselaraskan (pola sama dengan INSERT).
+ *  - Mengedit batch LAMA (perbaikan salah ketik) TIDAK menimpa harga produk —
+ *    harga produk harus tetap merepresentasikan batch terbaru. Tanpa guard ini,
+ *    edit batch lama akan "meng mundurkan" harga jual default POS.
+ *
+ * Trigger diganti (AFTER INSERT OR UPDATE OF ...) supaya kolom stok
+ * (qty_remaining, qty_damaged) yang berubah ribuan kali sehari TIDAK memicu
+ * sync harga sia-sia.
+ */
+const MIGRATION_NAME_11 = '0011_batch_update_trigger_and_edit';
+
+const DDL11 = `
+CREATE OR REPLACE FUNCTION public.fn_batch_update_product_cost() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_latest bigint;
+BEGIN
+    SELECT id INTO v_latest
+      FROM public.stock_batches
+     WHERE product_id = NEW.product_id
+     ORDER BY received_at DESC NULLS LAST, id DESC
+     LIMIT 1;
+
+    IF v_latest = NEW.id THEN
+        UPDATE product
+           SET harga_beli = NEW.unit_cost,
+               harga_jual = CASE WHEN NEW.markup_type IS NULL THEN product.harga_jual
+                                 ELSE NEW.suggested_price END,
+               updated_at = now()
+         WHERE id = NEW.product_id;
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_batch_update_product_cost ON public.stock_batches;
+CREATE TRIGGER trg_batch_update_product_cost
+    AFTER INSERT OR UPDATE OF unit_cost, markup_type, markup_value ON public.stock_batches
+    FOR EACH ROW EXECUTE FUNCTION public.fn_batch_update_product_cost();
+`;
+
+/**
  * Akun sistem `bot` = akun audit untuk order book yang dibuat lewat X-Internal-Key.
  *
  * - `is_active = false` -> `login()` menolak sebelum cek password, jadi akun ini
@@ -526,6 +571,7 @@ export async function migrate(): Promise<number> {
     await client.query(DDL8);
     await client.query(DDL9);
     await client.query(DDL10);
+    await client.query(DDL11);
 
     // P0: sinkronkan role OWNER awal dari konfigurasi .env ke kolom DB.
     const owners = [...env.roles.owner, ...[]].filter(Boolean);
@@ -653,6 +699,7 @@ if (isMain) {
       console.log(`[migrate] OK - ${MIGRATION_NAME_8}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_9}`);
       console.log(`[migrate] OK - ${MIGRATION_NAME_10}`);
+      console.log(`[migrate] OK - ${MIGRATION_NAME_11}`);
       console.log(`[migrate] user sistem bot (order book WA): id=${botId} (is_active=false, tidak bisa login)`);
 
       const res = await pool.query<{ server_version: string; db_now: Date; db_tz: string }>(

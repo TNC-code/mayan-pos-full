@@ -87,6 +87,11 @@ export function buildRouter(): Router {
   /* ---------------------------- purchases ----------------------------- */
   r.get('/purchases', vQuery(S.purchaseListSchema), h(stockCtrl.listPurchases));
   r.post('/purchases', KASIR, vBody(S.purchaseSchema), h(stockCtrl.createPurchase));
+  // Koreksi salah input barang masuk (guard: batch belum terpakai — lihat
+  // purchase.service.updateBatch). Terdaftar SEBELUM GET /purchases/batches/:id
+  // tidak masalah karena method berbeda; pattern sama namun Express cocokkan
+  // method + path berpasangan.
+  r.patch('/purchases/batches/:id', KASIR, vBody(S.batchUpdateSchema), h(stockCtrl.updateBatch));
   r.get('/purchases/batches/:id', h(stockCtrl.getBatch));
 
   /* ------------------------------- stock ------------------------------ */

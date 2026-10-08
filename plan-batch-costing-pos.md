@@ -241,3 +241,61 @@ Aturan modal:
 2. **BE**: openapi.yaml
 3. **E2E script** → jalankan → bukti flow 1–9
 4. **FE model/provider** → **form barang masuk** → **modal detail item** → unit test + `flutter analyze`
+
+---
+
+## 10. Amandemen A — Edit Barang Masuk + Top-up Batch (2026-10-08)
+
+> Permintaan: "kalau ada kesalahan input qty bisa diupdate?" → fitur koreksi + top-up,
+> dengan **note detail** (komentar kode, openapi, plan ini) dan openapi di-update.
+
+### 10.1 Migration 0011 `batch_update_trigger_and_edit`
+Trigger `fn_batch_update_product_cost` diperluas:
+- Firing: `AFTER INSERT OR UPDATE OF unit_cost, markup_type, markup_value` — perubahan kolom
+  stok (qty_remaining, ribuan kali sehari) TIDAK memicu sync harga sia-sia.
+- **Guard batch-terbaru**: sinkronisasi harga produk hanya bila batch yang ditulis adalah
+  batch TERBARU produknya (`ORDER BY received_at DESC NULLS LAST, id DESC LIMIT 1`).
+  Alasan: mengedit batch LAMA (perbaikan salah ketik) tidak boleh "meng mundurkan"
+  `harga_beli`/`harga_jual` produk yang sudah merepresentasikan batch terbaru.
+
+### 10.2 `PATCH /purchases/batches/{id}` — koreksi salah input (KASIR)
+| Aturan | Implementasi |
+|---|---|
+| Batch belum boleh terpakai | Guard: tidak ada `sale_items` / `stock_opname_items` / `supplier_return_items` / movement non-IN (kecuali `ADJUSTMENT` ber-`reference_type='BATCH_EDIT'` = jejak koreksi sebelumnya). Langgar → **409** + pesan arahan Opname/Retur |
+| Perubahan qty berjejak | Movement `ADJUSTMENT` (+/−) note "Koreksi salah input barang masuk: qty X -> Y" — ledger tetap utuh, qty_remaining berubah via trigger |
+| Urutan tulis demi constraint `chk_batch_remaining_le_received` | qty NAIK → UPDATE `qty_received` dulu baru movement; qty TURUN → movement dulu baru UPDATE (menghindari pelanggaran kondisi sementara `qty_remaining <= qty_received`) |
+| `batch_code` & `product_id` | Terkunci (tidak bisa pindah produk) |
+| Edit harga batch terbaru | `harga_beli`/`harga_jual` produk ter-sync (trigger 0011); batch lama tidak menimpa |
+| Zod | `batchUpdateSchema`: semua opsional, minimal satu (`refine`); `qty > 0` |
+
+### 10.3 `POST /purchases` + `merge_into_batch_id` — top-up barang susulan
+- Tidak membuat batch baru: `qty_received` dijumlah, movement `IN` baru ke batch tujuan
+  (audit per-event tetap utuh), pricing mengikuti batch tujuan (markup input diabaikan).
+- Syarat (server): produk sama (422) + `unit_cost` IDENTIK (422, pesan "wajib dibuat
+  batch baru") — harga berbeda = batch baru agar harga beli per batch tetap murni.
+- Urutan tulis: UPDATE `qty_received` dulu → movement IN (alasan constraint sama dengan 10.2).
+
+### 10.4 FE Flutter
+- `models/purchase.dart`: `PurchaseInput.mergeIntoBatchId` (toJson `?null-aware`) +
+  `BatchUpdateInput` (patch parsial, `isEmpty`).
+- `api/purchase_api.dart`: `updateBatch(id, input)`; `providers/purchases.dart`:
+  `batchUpdateProvider` (invalidate riwayat/stok/ledger/alerts/katalog POS).
+- Form barang masuk: dropdown **"Simpan ke"** (Batch baru / batch aktif produk); mode
+  top-up mengunci harga beli + markup (badge "harga wajib sama"), kirim `merge_into_batch_id`.
+- Dialog detail batch (Riwayat): tombol **Ubah** → `BatchEditDialog` — koreksi qty/harga/
+  markup/expired/supplier/catatan, hanya field berubah yang dikirim; error 409/422 tampil
+  inline (pesan server memandu ke Opname/Retur).
+
+### 10.5 Verifikasi
+- `scripts/e2e_batch_edit_topup.ts` — **32 PASS**: top-up sukses & guard-nya, koreksi qty
+  (ADJUSTMENT tercatat), sync harga batch terbaru, guard batch terpakai (409), edit batch
+  lama tidak menimpa harga produk.
+- `scripts/e2e_batch_nego.ts` tetap **33 PASS** setelah trigger 0011 (regresi aman).
+- FE: `flutter analyze` bersih; **568 test PASS**; uji manual tablet: top-up via form
+  (GRN-009 100→120 qty_received) dan koreksi via detail batch (GRN-040 50→45, ledger
+  `ADJUSTMENT -5`), guard 409 terbukti di batch yang sudah terjual.
+
+### 10.6 Catatan deploy
+- **Backend produksi (invcash.quotaku.com) harus di-deploy** agar fitur aktif di app
+  tablet yang memakai API produksi — app uji tablet memakai
+  `--dart-define=API_BASE_URL=http://10.0.2.2:3000/api/v1` (backend lokal).

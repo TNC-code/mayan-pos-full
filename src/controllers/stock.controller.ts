@@ -17,6 +17,16 @@ export async function createPurchase(req: Request, res: Response): Promise<void>
   res.status(201).json(batch);
 }
 
+/** Koreksi salah input barang masuk: `PATCH /purchases/batches/{id}` (KASIR only). */
+export async function updateBatch(req: Request, res: Response): Promise<void> {
+  const batch = await purchaseService.updateBatch(
+    asInt(req.params.id!, 'id'),
+    req.body as purchaseService.BatchUpdateInput,
+    req.user!.id,
+  );
+  res.status(200).json(batch);
+}
+
 export async function getBatch(req: Request, res: Response): Promise<void> {
   res.status(200).json(await purchaseService.getBatch(asInt(req.params.id!, 'id')));
 }

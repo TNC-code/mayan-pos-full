@@ -489,6 +489,35 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/StockBatch' }
         '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Purchases]
+      summary: Koreksi salah input barang masuk — KASIR only
+      description: |
+        Perbaiki qty / harga beli / markup / expired / supplier / catatan pada batch
+        yang **belum terpakai** (belum ada penjualan, opname, retur distributor, atau
+        mutasi keluar lain). Detail guard dan efek samping lihat `BatchUpdate`.
+
+        Efek samping:
+        * perubahan qty → movement `ADJUSTMENT` baru di `stock_movements` (ledger utuh,
+          qty_remaining berubah via trigger);
+        * perubahan `unit_cost`/markup pada batch TERBARU → `harga_beli`/`harga_jual`
+          produk ikut terselaraskan (trigger 0011); batch lama tidak menimpa harga produk;
+        * response 200 = row batch setelah koreksi (`suggested_price` dihitung ulang otomatis).
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BatchUpdate' }
+      responses:
+        '200':
+          description: Batch terkoreksi
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StockBatch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /products/{id}/batches:
     get:
@@ -1764,6 +1793,43 @@ components:
         expired_date: { type: string, format: date, nullable: true }
         supplier: { type: string }
         notes: { type: string }
+        merge_into_batch_id:
+          type: integer
+          nullable: true
+          description: |
+            **Top-up stok ke batch yang sudah ada** (barang susulan dari PO yang sama).
+            Bila diisi, TIDAK membuat batch baru:
+            * produk wajib sama dengan batch tujuan (422 bila beda),
+            * `unit_cost` wajib IDENTIK dengan batch tujuan (422 `VALIDATION_ERROR` bila beda —
+              barang dengan harga berbeda wajib batch baru supaya harga beli per batch tetap murni),
+            * `markup_type`/`markup_value` diabaikan — pricing mengikuti batch tujuan,
+            * `qty_received` batch = lama + qty, dan movement `IN` baru tercatat di ledger
+              (audit per-event tetap utuh),
+            * response 201 = row batch tujuan setelah ditambah.
+
+    BatchUpdate:
+      type: object
+      description: |
+        Koreksi salah input barang masuk. Semua field opsional, minimal satu diisi.
+        **Guard server** (409 `CONCURRENT_CONFLICT` bila dilanggar): batch belum boleh
+        punya penjualan / opname / retur distributor / mutasi keluar apa pun — setelah
+        barang terpakai, koreksi hanya lewat Opname (selisih fisik) atau Retur.
+        Aturan lain: `qty` baru >= 1 dan tidak boleh di bawah `qty_remaining` (422);
+        `batch_code` & `product_id` terkunci; perubahan qty tercatat sebagai movement
+        `ADJUSTMENT` (ledger tetap utuh); perubahan harga pada batch TERBARU ikut
+        menyelaraskan `harga_beli`/`harga_jual` produk (trigger 0011) — batch lama tidak menimpa harga produk.
+      properties:
+        qty: { type: number, description: 'qty_received baru (>= 1, >= qty_remaining)' }
+        unit_cost: { type: number, format: float, description: 'harga beli baru — batch terbaru akan menselaraskan harga_beli produk' }
+        markup_type:
+          type: string
+          nullable: true
+          enum: [AMOUNT, PERCENT]
+          description: 'mode markup baru (ikut menselaraskan harga_jual produk bila batch terbaru)'
+        markup_value: { type: number, format: float }
+        expired_date: { type: string, format: date, nullable: true }
+        supplier: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
 
     PaymentMethod:
       type: object
