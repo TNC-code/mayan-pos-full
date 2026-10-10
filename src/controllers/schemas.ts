@@ -171,9 +171,12 @@ export const purchaseListSchema = z.object({
   offset: z.coerce.number().int().min(0).default(0),
 });
 
-/** Picker batch layar kasir: `GET /products/{id}/batches` (req #1 — pilih batch di POS). */
+/** Picker batch layar kasir: `GET /products/{id}/batches` (req #1 — pilih batch di POS).
+ *  `qty` opsional → tiap batch diberi `suggested_qty` (alokasi FIFO dari server,
+ *  batch terlama penuh dulu) supaya semua client memakai aturan alokasi yang sama. */
 export const productBatchListSchema = z.object({
   available_only: boolish.default(true),
+  qty: qty.nullish(),
 });
 
 /* ------------------------------ sales ------------------------------ */

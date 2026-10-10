@@ -531,6 +531,7 @@ paths:
       parameters:
         - { $ref: '#/components/parameters/Id' }
         - { name: available_only, in: query, schema: { type: boolean, default: true }, description: 'hanya batch dengan qty_remaining > 0' }
+        - { name: qty, in: query, schema: { type: number }, description: 'opsional — minta saran alokasi FIFO untuk qty ini: tiap batch diberi `suggested_qty` (batch terlama penuh dulu). Bila total stok < qty, seluruh batch terisi penuh dan kekurangan = qty − Σ suggested_qty (divalidasi ulang saat POST /sales).' }
       responses:
         '200':
           description: OK
@@ -1770,6 +1771,9 @@ components:
           enum: [AMOUNT, PERCENT, null]
           description: 'mode markup harga jual usulan (0010); NULL = batch lama sebelum fitur'
         markup_value: { type: number, format: float, example: 1000.00 }
+        suggested_qty:
+          type: number
+          description: 'hanya ada bila picker dipanggil dengan query `qty` — saran alokasi FIFO dari server untuk qty tersebut (0 = batch tidak terpakai dalam saran)'
         suggested_price:
           type: number
           format: float

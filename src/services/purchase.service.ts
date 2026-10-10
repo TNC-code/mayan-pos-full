@@ -358,11 +358,19 @@ export async function updateBatch(batchId: number, input: BatchUpdateInput, upda
  * batch punya sisa stok (qty_remaining), harga beli (unit_cost — floor nego), dan
  * harga jual usulan (suggested_price dari markup batch). Urutan FIFO dengan
  * expired NULLS LAST (sama dengan auto-FIFO resolveBatchId di sale.service).
+ *
+ * `qty` (opsional) → tiap batch diberi `suggested_qty`: alokasi FIFO hitungan
+ * server (batch terlama penuh dulu, sisanya ke batch berikutnya). Tujuannya
+ * satu aturan alokasi untuk semua client (FE/WA bot/integrasi) — FE bebas
+ * menghitung ulang lokal selama algoritmanya sama (greedy pada urutan ini).
+ * Bila total stok < qty, seluruh batch terisi penuh dan kekurangan terlihat
+ * dari `qty - Σ suggested_qty` (divalidasi ulang server saat POST /sales).
  */
 export async function listProductBatches(
   productId: number,
   availableOnly: boolean,
-): Promise<BatchRow[]> {
+  qty?: number | null,
+): Promise<Array<BatchRow & { suggested_qty: number }>> {
   const product = await pool.query<{ id: number }>(`SELECT id FROM product WHERE id = $1`, [productId]);
   if (!product.rows[0]) {
     throw new ApiError('NOT_FOUND', `Produk id=${productId} tidak ditemukan`);
@@ -379,5 +387,15 @@ export async function listProductBatches(
      LIMIT $2`,
     args as never[],
   );
-  return res.rows;
+
+  // Alokasi FIFO greedy hanya bila pemanggil minta saran (qty dikirim).
+  let remaining = qty != null && qty > 0 ? qty : null;
+  return res.rows.map((row) => {
+    let suggested = 0;
+    if (remaining != null && remaining > 0.0005) {
+      suggested = Number(Math.min(row.qty_remaining, remaining).toFixed(3));
+      remaining = Number((remaining - suggested).toFixed(3));
+    }
+    return { ...row, suggested_qty: suggested };
+  });
 }

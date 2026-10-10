@@ -31,10 +31,11 @@ export async function getBatch(req: Request, res: Response): Promise<void> {
   res.status(200).json(await purchaseService.getBatch(asInt(req.params.id!, 'id')));
 }
 
-/** Picker batch layar kasir: `GET /products/{id}/batches` (baruplan.md req #1). */
+/** Picker batch layar kasir: `GET /products/{id}/batches` (baruplan.md req #1).
+ *  `qty` opsional → sertakan `suggested_qty` (alokasi FIFO dari server). */
 export async function listProductBatches(req: Request, res: Response): Promise<void> {
-  const q = validated<{ available_only: boolean }>(res);
-  res.status(200).json(await purchaseService.listProductBatches(asInt(req.params.id!, 'id'), q.available_only));
+  const q = validated<{ available_only: boolean; qty?: number | null }>(res);
+  res.status(200).json(await purchaseService.listProductBatches(asInt(req.params.id!, 'id'), q.available_only, q.qty ?? null));
 }
 
 /* ------------------------------- stock ------------------------------- */
