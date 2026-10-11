@@ -1,22 +1,25 @@
 import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { closePool, pool } from './config/db.js';
-import { verifyBaseline } from './db/migrate.js';
+import { sequelize } from './db/sequelize.js';
+import { verifySchema } from './db/check.js';
 import { purgeIdempotencyKeys } from './services/idempotency.service.js';
 
 async function main(): Promise<void> {
   // Fail fast kalau kredensial/schemanya salah.
   try {
-    await pool.query('SELECT 1');
+    await sequelize.authenticate();
   } catch (err) {
     console.error('[boot] gagal terhubung ke PostgreSQL:', err instanceof Error ? err.message : err);
     process.exit(1);
   }
 
-  const baseline = await verifyBaseline();
-  if (!baseline.ok) {
+  const schema = await verifySchema();
+  if (!schema.ok) {
     console.error(
-      `[boot] baseline DB tidak lengkap. Tabel hilang: [${baseline.missingTables}] Trigger hilang: [${baseline.missingTriggers}]`,
+      `[boot] skema DB tidak lengkap. Tabel hilang: [${schema.missingTables}] ` +
+        `Trigger hilang: [${schema.missingTriggers}] Sequence hilang: [${schema.missingSequences}] ` +
+        `Kolom entitlement hilang: [${schema.missingEntitlementColumns}] store_profile id=1: ${schema.hasStoreRow}`,
     );
     process.exit(1);
   }
@@ -34,6 +37,7 @@ async function main(): Promise<void> {
     console.log(`[shutdown] ${signal} diterima, menutup server...`);
     clearInterval(housekeeping);
     server.close(async () => {
+      await sequelize.close();
       await closePool();
       process.exit(0);
     });

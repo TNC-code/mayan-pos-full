@@ -1,5 +1,25 @@
-import { pool } from '../config/db.js';
+import { Op, type Includeable } from 'sequelize';
 import { ApiError, notFound } from '../utils/errors.js';
+import { mapOrmError } from '../utils/orm-errors.js';
+import { Product, ProductCategory } from '../models/index.js';
+
+/**
+ * CRUD produk di atas Sequelize.
+ *
+ * Bentuk response (`ProductRow`) dan semantik filter DISAMAKAN PERSIS dengan
+ * implementasi raw SQL lama (`git show HEAD:src/services/product.service.ts`):
+ *  - kolom `desctiption` (typo schema) diekspos sebagai `description`;
+ *  - `category_name` diambil dari LEFT JOIN `product_category`;
+ *  - list: filter q (name/sku/barcode ILIKE), category_id, `active`;
+ *    tanpa `active` -> produk nonaktif TETAP tampil (parity), `limit/offset`,
+ *    urutan `name ASC`;
+ *  - create: default `unit='pcs'`, `attributes={}`, `is_active=true`, `min_stock=0`;
+ *  - update: patch semantics (hanya kolom yang dikirim) + `updated_at = now()`;
+ *  - delete = soft (`is_active=false`), bukan hard delete.
+ *
+ * Catatan scope: default scope model menyembunyikan produk nonaktif; endpoint ini
+ * secara kontrak tetap membacanya -> selalu lewat `.scope('withInactive')`.
+ */
 
 export interface ProductRow {
   id: number;
@@ -20,48 +40,12 @@ export interface ProductRow {
   updated_at: string;
 }
 
-const SELECT_PRODUCT = `
-  SELECT p.id, p.sku, p.barcode, p.name, p.unit, p.category_id, c.name AS category_name,
-         p.desctiption AS description, p.harga_beli, p.harga_jual, p.attributes, p.is_active,
-         p.min_stock, p.unit_conversions,
-         p.created_at, p.updated_at
-    FROM product p
-    LEFT JOIN product_category c ON c.id = p.category_id
-`;
-
 export interface ProductListQuery {
   q?: string;
   category_id?: number;
   active?: boolean;
   limit: number;
   offset: number;
-}
-
-export async function listProducts(q: ProductListQuery): Promise<ProductRow[]> {
-  const where: string[] = [];
-  const params: unknown[] = [];
-
-  if (q.q) {
-    params.push(`%${q.q}%`);
-    where.push(`(p.name ILIKE $${params.length} OR p.sku ILIKE $${params.length} OR p.barcode ILIKE $${params.length})`);
-  }
-  if (q.category_id !== undefined) {
-    params.push(q.category_id);
-    where.push(`p.category_id = $${params.length}`);
-  }
-  if (q.active !== undefined) {
-    params.push(q.active);
-    where.push(`p.is_active = $${params.length}`);
-  }
-
-  params.push(q.limit, q.offset);
-  const sql = `${SELECT_PRODUCT}
-    ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
-    ORDER BY p.name ASC
-    LIMIT $${params.length - 1} OFFSET $${params.length}`;
-
-  const res = await pool.query<ProductRow>(sql, params as never[]);
-  return res.rows;
 }
 
 export interface ProductInput {
@@ -79,77 +63,135 @@ export interface ProductInput {
   is_active?: boolean;
 }
 
-export async function createProduct(input: ProductInput): Promise<ProductRow> {
-  const res = await pool.query<{ id: number }>(
-    `INSERT INTO product (sku, barcode, name, unit, category_id, desctiption, harga_beli, harga_jual, attributes, is_active, min_stock, unit_conversions, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, COALESCE($10, true), COALESCE($11, 0), $12::jsonb, now())
-     RETURNING id`,
-    [
-      input.sku ?? null,
-      input.barcode ?? null,
-      input.name,
-      input.unit ?? 'pcs',
-      input.category_id ?? null,
-      input.description ?? null,
-      input.harga_beli ?? null,
-      input.harga_jual ?? null,
-      JSON.stringify(input.attributes ?? {}),
-      input.is_active ?? true,
-      input.min_stock ?? 0,
-      input.unit_conversions ? JSON.stringify(input.unit_conversions) : null,
-    ],
-  );
-  return getProduct(res.rows[0]!.id);
+const WITH_CATEGORY: Includeable = {
+  model: ProductCategory,
+  as: 'category',
+  attributes: ['id', 'name'],
+  required: false,
+};
+
+type ProductWithCategory = Product & { category?: { id: number; name: string | null } | null };
+
+function toProductRow(row: ProductWithCategory): ProductRow {
+  return {
+    id: row.id,
+    sku: row.sku,
+    barcode: row.barcode,
+    name: row.name ?? '',
+    unit: row.unit,
+    category_id: row.category_id,
+    category_name: row.category?.name ?? null,
+    description: row.desctiption,
+    harga_beli: row.harga_beli,
+    harga_jual: row.harga_jual,
+    attributes: row.attributes ?? {},
+    is_active: row.is_active ?? true,
+    min_stock: row.min_stock ?? 0,
+    unit_conversions: row.unit_conversions,
+    created_at: new Date(row.created_at).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(),
+  };
+}
+
+export async function listProducts(q: ProductListQuery): Promise<ProductRow[]> {
+  const where_: Record<string, unknown>[] = [];
+
+  if (q.q) {
+    // ILIKE atas name/sku/barcode (sama seperti SQL lama). Dipakai bentuk objek
+    // supaya Sequelize yang menuliskan qualify kolom ke alias tabel yang benar.
+    const like = `%${q.q}%`;
+    where_.push({
+      [Op.or]: [{ name: { [Op.iLike]: like } }, { sku: { [Op.iLike]: like } }, { barcode: { [Op.iLike]: like } }],
+    });
+  }
+  if (q.category_id !== undefined) where_.push({ category_id: q.category_id });
+  if (q.active !== undefined) where_.push({ is_active: q.active });
+
+  const rows = await Product.scope('withInactive').findAll({
+    where: { [Op.and]: where_ },
+    include: [WITH_CATEGORY],
+    order: [['name', 'ASC']],
+    limit: q.limit,
+    offset: q.offset,
+  });
+
+  return (rows as unknown as ProductWithCategory[]).map(toProductRow);
 }
 
 export async function getProduct(id: number): Promise<ProductRow> {
-  const res = await pool.query<ProductRow>(`${SELECT_PRODUCT} WHERE p.id = $1`, [id]);
-  if (!res.rows[0]) throw notFound(`Produk id=${id} tidak ditemukan`);
-  return res.rows[0];
+  const row = await Product.scope('withInactive').findByPk(id, { include: [WITH_CATEGORY] });
+  if (!row) throw notFound(`Produk id=${id} tidak ditemukan`);
+  return toProductRow(row as unknown as ProductWithCategory);
 }
 
-/** Patch semantics: hanya kolom yang dikirim yang diubah (COALESCE dengan NULL check eksplisit). */
+/** Baris produk TANPA filter `is_active` (patch/soft delete harus bisa kena produk nonaktif). */
+async function findProductRow(id: number): Promise<Product> {
+  const row = await Product.scope('withInactive').findByPk(id);
+  if (!row) throw notFound(`Produk id=${id} tidak ditemukan`);
+  return row;
+}
+
+export async function createProduct(input: ProductInput): Promise<ProductRow> {
+  let created;
+  try {
+    created = await Product.create({
+      sku: input.sku ?? null,
+      barcode: input.barcode ?? null,
+      name: input.name,
+      unit: input.unit ?? 'pcs',
+      category_id: input.category_id ?? null,
+      desctiption: input.description ?? null,
+      harga_beli: input.harga_beli ?? null,
+      harga_jual: input.harga_jual ?? null,
+      attributes: input.attributes ?? {},
+      is_active: input.is_active ?? true,
+      min_stock: input.min_stock ?? 0,
+      unit_conversions: input.unit_conversions ?? null,
+    });
+  } catch (err) {
+    // SKU/barcode kembar (uq_product_sku/uq_product_barcode) -> 409 DUPLICATE.
+    throw mapOrmError(err);
+  }
+  return getProduct(created.id);
+}
+
+/** Patch semantics: hanya kolom yang dikirim yang diubah. */
 export async function updateProduct(id: number, input: Partial<ProductInput>): Promise<ProductRow> {
-  const sets: string[] = [];
-  const params: unknown[] = [];
+  const patch: Record<string, unknown> = {};
 
-  const push = (col: string, value: unknown, cast = '') => {
-    params.push(value);
-    sets.push(`${col} = $${params.length}${cast}`);
-  };
+  if (input.name !== undefined) patch.name = input.name;
+  if (input.sku !== undefined) patch.sku = input.sku;
+  if (input.barcode !== undefined) patch.barcode = input.barcode;
+  if (input.unit !== undefined) patch.unit = input.unit;
+  if (input.category_id !== undefined) patch.category_id = input.category_id;
+  if (input.description !== undefined) patch.desctiption = input.description;
+  if (input.harga_beli !== undefined) patch.harga_beli = input.harga_beli;
+  if (input.harga_jual !== undefined) patch.harga_jual = input.harga_jual;
+  if (input.attributes !== undefined) patch.attributes = input.attributes;
+  if (input.min_stock !== undefined) patch.min_stock = input.min_stock;
+  if (input.unit_conversions !== undefined) patch.unit_conversions = input.unit_conversions;
+  if (input.is_active !== undefined) patch.is_active = input.is_active;
 
-  if (input.name !== undefined) push('name', input.name);
-  if (input.sku !== undefined) push('sku', input.sku);
-  if (input.barcode !== undefined) push('barcode', input.barcode);
-  if (input.unit !== undefined) push('unit', input.unit);
-  if (input.category_id !== undefined) push('category_id', input.category_id);
-  if (input.description !== undefined) push('desctiption', input.description);
-  if (input.harga_beli !== undefined) push('harga_beli', input.harga_beli);
-  if (input.harga_jual !== undefined) push('harga_jual', input.harga_jual);
-  if (input.attributes !== undefined) push('attributes', JSON.stringify(input.attributes), '::jsonb');
-  if (input.min_stock !== undefined) push('min_stock', input.min_stock);
-  if (input.unit_conversions !== undefined) push('unit_conversions', input.unit_conversions ? JSON.stringify(input.unit_conversions) : null, '::jsonb');
-  if (input.is_active !== undefined) push('is_active', input.is_active);
-
-  if (sets.length === 0) {
+  if (Object.keys(patch).length === 0) {
     throw new ApiError('VALIDATION_ERROR', 'Tidak ada kolom yang akan diubah');
   }
 
-  sets.push('updated_at = now()');
-  params.push(id);
-
-  const res = await pool.query(`UPDATE product SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING id`, params as never[]);
-  if (res.rowCount === 0) throw notFound(`Produk id=${id} tidak ditemukan`);
+  const row = await findProductRow(id);
+  try {
+    await row.update(patch);
+  } catch (err) {
+    // SKU/barcode kembar saat patch -> 409 DUPLICATE (parity dengan jalur raw SQL).
+    throw mapOrmError(err);
+  }
   return getProduct(id);
 }
 
 /**
- * Soft delete (FASE 1): produk nonaktif, histori stok & ledger tetap utuh.
- * Hard delete ditolak bila sudah pernah dipakai di batch/sale (FK) -> jadi soft delete
- * adalah perilaku yang benar secara audit.
+ * Soft delete: produk nonaktif, histori stok & ledger tetap utuh.
+ * Hard delete ditolak bila produk sudah pernah dipakai di batch/sale (FK).
  */
 export async function deactivateProduct(id: number): Promise<ProductRow> {
-  const res = await pool.query(`UPDATE product SET is_active = false, updated_at = now() WHERE id = $1 RETURNING id`, [id]);
-  if (res.rowCount === 0) throw notFound(`Produk id=${id} tidak ditemukan`);
+  const row = await findProductRow(id);
+  await row.update({ is_active: false });
   return getProduct(id);
 }

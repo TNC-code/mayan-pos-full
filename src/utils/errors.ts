@@ -36,7 +36,10 @@ export type ErrorCode =
   | 'ORDER_ALREADY_DONE'
   | 'ORDER_STATUS_TRANSITION'
   | 'ORDER_CONVERT_INVALID'
-  | 'ORDER_LAST_ITEM';
+  | 'ORDER_LAST_ITEM'
+  | 'MODULE_NOT_ACTIVE'
+  | 'TRIAL_EXPIRED'
+  | 'AKUN_SUSPENDED';
 
 /**
  * Peta error -> HTTP.
@@ -48,6 +51,11 @@ const STATUS: Record<ErrorCode, number> = {
   UNAUTHORIZED: 401,
   INTERNAL_KEY_INVALID: 401,
   FORBIDDEN: 403,
+  // Gate subscription per modul (plan §D8 — dipasang di MP-8, kode didaftarkan
+  // dari MP-1 supaya peta code->HTTP lengkap sebelum middleware gate hidup).
+  MODULE_NOT_ACTIVE: 403,
+  TRIAL_EXPIRED: 403,
+  AKUN_SUSPENDED: 403,
   NOT_FOUND: 404,
   ORDER_NOT_FOUND: 404,
   ORDER_ITEM_NOT_FOUND: 404,

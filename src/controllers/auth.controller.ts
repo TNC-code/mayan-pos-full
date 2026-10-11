@@ -7,11 +7,17 @@ export async function login(req: Request, res: Response): Promise<void> {
   res.status(200).json(result);
 }
 
-/** Tukar refresh token -> JWT baru (tidak butuh JWT, cukup refresh token valid). */
+/** Tukar refresh token -> JWT baru (tidak butuh JWT, cukup refresh token valid).
+ *  Rotasi: token lama dicabut, `refresh_token` baru dikembalikan (field additive —
+ *  FE memakai yang baru kalau ada, lihat fe/lib/api/auth_api.dart). */
 export async function refresh(req: Request, res: Response): Promise<void> {
   const { refresh_token: refreshToken } = req.body as { refresh_token: string };
-  const { token, user } = await authService.refreshAccessToken(refreshToken);
-  res.status(200).json({ token, user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role } });
+  const { token, refresh_token, user } = await authService.refreshAccessToken(refreshToken);
+  res.status(200).json({
+    token,
+    refresh_token,
+    user: { id: user.id, username: user.username, full_name: user.full_name, role: user.role },
+  });
 }
 
 /** Logout: cabut refresh token. */
