@@ -41,11 +41,23 @@ const RETRYABLE_PG_CODES = new Set(['40001', '40P01', '55P03', '57P01']);
 export function isRetryableDbError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   if (err instanceof ApiError) return false;
-  const code = (err as DatabaseError).code;
-  if (typeof code === 'string' && RETRYABLE_PG_CODES.has(code)) return true;
+  // Error Sequelize membungkus error `pg` asli di `parent`/`original`, jadi kode
+  // SQLSTATE harus dibaca dari sana juga — tanpa ini, retry policy `fase.md`
+  // tidak pernah aktif untuk service yang sudah pindah ke ORM (MP-2 dst).
+  const sources: Array<{ code?: unknown } | undefined> = [
+    err as { code?: unknown },
+    (err as { parent?: { code?: unknown } }).parent,
+    (err as { original?: { code?: unknown } }).original,
+  ];
+  for (const source of sources) {
+    if (typeof source?.code === 'string' && RETRYABLE_PG_CODES.has(source.code)) return true;
+  }
   // Error jaringan: ECONNREFUSED / ETIMEDOUT / socket hang up / server closed
+  const message = `${err.message} ${String((err as { parent?: unknown }).parent ?? '')} ${
+    (sources[1] as Error | undefined)?.message ?? ''
+  }`;
   return /ECONNREFUSED|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|terminating connection|Client has encountered a connection error/i.test(
-    err.message,
+    message,
   );
 }
 

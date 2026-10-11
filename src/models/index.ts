@@ -4,6 +4,8 @@ import { initUserAccount, UserAccount } from './user-account.model.js';
 import { initRefreshToken, RefreshToken } from './refresh-token.model.js';
 import { initProduct, Product } from './product.model.js';
 import { initProductCategory, ProductCategory } from './product-category.model.js';
+import { initProductType, ProductType } from './product-type.model.js';
+import { initCustomer, Customer } from './customer.model.js';
 import { initPaymentMethod, PaymentMethod } from './payment-method.model.js';
 import { initStoreProfile, StoreProfile } from './store-profile.model.js';
 import { initIdempotencyKey, IdempotencyKey } from './idempotency-key.model.js';
@@ -41,13 +43,15 @@ export function initModels(instance: Sequelize = sequelize): void {
   initRefreshToken(instance);
   initProduct(instance);
   initProductCategory(instance);
+  initProductType(instance);
+  initCustomer(instance);
   initPaymentMethod(instance);
   initStoreProfile(instance);
   initIdempotencyKey(instance);
   initialized = true;
 }
 
-/** Associations (MP-1: subset inti). Foreign key selalu ditulis eksplisit. */
+/** Associations (MP-1 subset inti, MP-2 master data). Foreign key selalu ditulis eksplisit. */
 export function associate(): void {
   if (associated) return;
   initModels();
@@ -58,6 +62,13 @@ export function associate(): void {
   Product.belongsTo(ProductCategory, { foreignKey: 'category_id', as: 'category' });
   ProductCategory.hasMany(Product, { foreignKey: 'category_id', as: 'products' });
 
+  // Product -> Category -> Type (MP-2.1). `id_type` nullable, jadi include selalu `required: false`.
+  ProductCategory.belongsTo(ProductType, { foreignKey: 'id_type', as: 'type' });
+  ProductType.hasMany(ProductCategory, { foreignKey: 'id_type', as: 'categories' });
+
+  // Customer <-> Sales ditunda ke MP-4.1 (butuh `sale.model.ts`); sementara ini
+  // `sales.customer_id` dibaca lewat kolom FK langsung, sama seperti versi raw SQL.
+
   associated = true;
 }
 
@@ -67,10 +78,12 @@ associate();
 
 export { sequelize };
 export {
+  Customer,
   IdempotencyKey,
   PaymentMethod,
   Product,
   ProductCategory,
+  ProductType,
   RefreshToken,
   StoreProfile,
   UserAccount,
@@ -79,6 +92,8 @@ export type { ModuleEntitlement, StoreModules, AccountStatus } from './store-pro
 export type { UserRole } from './user-account.model.js';
 export type { ProductAttributes, ProductCategoryRef } from './product.model.js';
 export type { ProductCategoryAttributes } from './product-category.model.js';
+export type { ProductTypeAttributes } from './product-type.model.js';
+export type { CustomerAttributes } from './customer.model.js';
 export type { PaymentMethodAttributes } from './payment-method.model.js';
 export type { IdempotencyKeyAttributes } from './idempotency-key.model.js';
 export type { RefreshTokenAttributes } from './refresh-token.model.js';

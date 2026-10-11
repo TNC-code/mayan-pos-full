@@ -1,9 +1,25 @@
-import { pool } from '../config/db.js';
+import { Op } from 'sequelize';
 import { ApiError, notFound } from '../utils/errors.js';
+import { mapOrmError } from '../utils/orm-errors.js';
+import { Customer } from '../models/index.js';
+
+/**
+ * Customer di atas Sequelize (MP-2).
+ *
+ * Paritas dengan versi raw SQL lama (`git show HEAD~1:src/services/customer.service.ts`):
+ *  - list: filter `q` ILIKE atas `name`/`phone`/`owner_name`, urutan `name ASC`,
+ *    `limit`/`offset` (default dari zod: 50/0);
+ *  - create: kolom kosong -> NULL;
+ *  - patch kosong -> `VALIDATION_ERROR` "Tidak ada kolom yang akan diubah";
+ *  - id tak ada -> `NOT_FOUND` 404 ("Customer id=… tidak ditemukan").
+ *
+ * Customer opsional untuk walk-in (FASE 1): tidak ada `is_active`, jadi daftar
+ * tidak pernah disaring.
+ */
 
 export interface CustomerRow {
   id: number;
-  name: string;
+  name: string | null;
   address: string | null;
   phone: string | null;
   owner_name: string | null;
@@ -15,23 +31,32 @@ export interface CustomerListQuery {
   offset: number;
 }
 
-/** Customer opsional untuk walk-in (FASE 1). */
+function toCustomerRow(row: Customer): CustomerRow {
+  return {
+    id: row.id,
+    name: row.name,
+    address: row.address,
+    phone: row.phone,
+    owner_name: row.owner_name,
+  };
+}
+
 export async function listCustomers(q: CustomerListQuery): Promise<CustomerRow[]> {
-  const params: unknown[] = [];
-  let where = '';
-  if (q.q) {
-    params.push(`%${q.q}%`);
-    where = `WHERE (c.name ILIKE $1 OR c.phone ILIKE $1 OR c.owner_name ILIKE $1)`;
-  }
-  params.push(q.limit, q.offset);
-  const res = await pool.query<CustomerRow>(
-    `SELECT c.id, c.name, c.address, c.phone, c.owner_name
-       FROM customer c ${where}
-      ORDER BY c.name ASC
-      LIMIT $${params.length - 1} OFFSET $${params.length}`,
-    params as never[],
-  );
-  return res.rows;
+  const rows = await Customer.findAll({
+    where: q.q
+      ? {
+          [Op.or]: [
+            { name: { [Op.iLike]: `%${q.q}%` } },
+            { phone: { [Op.iLike]: `%${q.q}%` } },
+            { owner_name: { [Op.iLike]: `%${q.q}%` } },
+          ],
+        }
+      : undefined,
+    order: [['name', 'ASC']],
+    limit: q.limit,
+    offset: q.offset,
+  });
+  return rows.map(toCustomerRow);
 }
 
 export interface CustomerInput {
@@ -42,51 +67,39 @@ export interface CustomerInput {
 }
 
 export async function createCustomer(input: CustomerInput): Promise<CustomerRow> {
-  const res = await pool.query<CustomerRow>(
-    `INSERT INTO customer (name, address, phone, owner_name)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, name, address, phone, owner_name`,
-    [input.name, input.address ?? null, input.phone ?? null, input.owner_name ?? null],
-  );
-  return res.rows[0]!;
+  try {
+    const created = await Customer.create({
+      name: input.name,
+      address: input.address ?? null,
+      phone: input.phone ?? null,
+      owner_name: input.owner_name ?? null,
+    });
+    return toCustomerRow(created);
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
 export async function getCustomer(id: number): Promise<CustomerRow> {
-  const res = await pool.query<CustomerRow>(
-    `SELECT id, name, address, phone, owner_name FROM customer WHERE id = $1`,
-    [id],
-  );
-  if (!res.rows[0]) throw notFound(`Customer id=${id} tidak ditemukan`);
-  return res.rows[0];
+  const row = await Customer.findByPk(id);
+  if (!row) throw notFound(`Customer id=${id} tidak ditemukan`);
+  return toCustomerRow(row);
 }
 
+/** Patch semantics: hanya kolom yang dikirim yang diubah. */
 export async function updateCustomer(id: number, patch: Partial<CustomerInput>): Promise<CustomerRow> {
-  const sets: string[] = [];
-  const params: unknown[] = [];
-  if (patch.name !== undefined) {
-    params.push(patch.name);
-    sets.push(`name = $${params.length}`);
-  }
-  if (patch.address !== undefined) {
-    params.push(patch.address);
-    sets.push(`address = $${params.length}`);
-  }
-  if (patch.phone !== undefined) {
-    params.push(patch.phone);
-    sets.push(`phone = $${params.length}`);
-  }
-  if (patch.owner_name !== undefined) {
-    params.push(patch.owner_name);
-    sets.push(`owner_name = $${params.length}`);
-  }
-  if (sets.length === 0) throw new ApiError('VALIDATION_ERROR', 'Tidak ada kolom yang akan diubah');
+  const values: Record<string, unknown> = {};
+  if (patch.name !== undefined) values.name = patch.name;
+  if (patch.address !== undefined) values.address = patch.address;
+  if (patch.phone !== undefined) values.phone = patch.phone;
+  if (patch.owner_name !== undefined) values.owner_name = patch.owner_name;
 
-  params.push(id);
-  const res = await pool.query(
-    `UPDATE customer SET ${sets.join(', ')} WHERE id = $${params.length}
-     RETURNING id, name, address, phone, owner_name`,
-    params as never[],
-  );
-  if (!res.rows[0]) throw notFound(`Customer id=${id} tidak ditemukan`);
-  return res.rows[0];
+  if (Object.keys(values).length === 0) {
+    throw new ApiError('VALIDATION_ERROR', 'Tidak ada kolom yang akan diubah');
+  }
+
+  const row = await Customer.findByPk(id);
+  if (!row) throw notFound(`Customer id=${id} tidak ditemukan`);
+  await row.update(values);
+  return toCustomerRow(row);
 }

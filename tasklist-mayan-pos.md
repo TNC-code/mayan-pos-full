@@ -72,7 +72,7 @@
 
 ### MP-2.2 Services Sequelize
 - [ ] `category.service.ts`: list/create/update (`DUPLICATE` 409 pada nama kembar)
-- [ ] `product.service.ts`: tambah `listProductTypes/createProductType`
+- [x] `category.service.ts`: `listProductTypes/createProductType` (lokasi mengikuti controller master — bukan product.service)
 - [ ] `customer.service.ts`: list (filter q/phone)/get/create/update
 - [ ] `payment-method.service.ts`: list/get/create/update (`PAYMENT_METHOD_INACTIVE` saat dipakai bayar — uji di MP-4)
 - [ ] `store.service.ts`: `getStore` (single row id=1) + `updateStore` (KASIR; OWNER 403)

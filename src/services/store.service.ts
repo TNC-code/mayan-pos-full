@@ -1,9 +1,32 @@
-import { pool } from '../config/db.js';
 import { ApiError } from '../utils/errors.js';
-import { withTx } from '../utils/tx.js';
+import { withRetry } from '../utils/tx.js';
+import { StoreProfile, sequelize, type AccountStatus, type StoreModules } from '../models/index.js';
 import { getSale } from './sale.service.js';
 
-export interface StoreProfile {
+/**
+ * Profil toko di atas Sequelize (MP-2) + nota/`saleReceipt`.
+ *
+ * Paritas dengan versi raw SQL lama (`git show HEAD~1:src/services/store.service.ts`):
+ *  - `getStoreProfile()` membaca satu baris `id = 1` dan mengembalikan SELURUH
+ *    kolom baris itu (SQL lama `SELECT *`, termasuk kolom entitlement
+ *    `modules`/`trial_ends_at`/`suspended_at`/`account_status` yang ditambahkan
+ *    baseline migration) — jadi bentuk response tidak berubah sama sekali;
+ *  - baris hilang -> `INTERNAL_ERROR` "Profil toko belum diinisialisasi
+ *    (jalankan migrasi)";
+ *  - `updateStoreProfile()`: patch semantics (hanya kolom yang dikirim),
+ *    `updated_at` disentuh, `updated_by` = user pemanggil, patch kosong ->
+ *    `VALIDATION_ERROR` "Tidak ada kolom yang akan diubah", dan baris dibaca
+ *    kembali DI DALAM transaksi yang sama (identik dengan versi lama yang tidak
+ *    bisa membaca lewat pool sebelum commit);
+ *  - retry policy `fase.md` tetap lewat `withRetry` (hanya error koneksi/serialisasi).
+ *
+ * Catatan `saleReceipt`: dirakit tetap sama, tapi sumber `store` sekarang model
+ * Sequelize sedangkan `sale` masih dibaca lewat `getSale()` yang versi raw SQL
+ *-nya baru pindah di MP-4. Mengangkat `getSale()` di MP-2 berarti ikut menarik
+ * modul sales ke scope MP-2, jadi keduanya sengaja dibiarkan terpisah sampai MP-4.
+ */
+
+export interface StoreProfileRow {
   id: number;
   name: string;
   address: string | null;
@@ -13,14 +36,41 @@ export interface StoreProfile {
   receipt_footer: string | null;
   logo_url: string | null;
   updated_at: string;
+  updated_by: number | null;
+  /** Entitlement subscription per modul (gate MP-8; ikut tampil sejak baseline). */
+  modules: StoreModules;
+  trial_ends_at: string | null;
+  suspended_at: string | null;
+  account_status: AccountStatus;
 }
 
-export async function getStoreProfile(): Promise<StoreProfile> {
-  const res = await pool.query<StoreProfile>(`SELECT * FROM store_profile WHERE id = 1`);
-  if (!res.rows[0]) {
+const isoOrNull = (value: Date | null): string | null => (value ? new Date(value).toISOString() : null);
+
+function toStoreProfileRow(row: StoreProfile): StoreProfileRow {
+  return {
+    id: row.id,
+    name: row.name,
+    address: row.address,
+    phone: row.phone,
+    email: row.email,
+    npwp: row.npwp,
+    receipt_footer: row.receipt_footer,
+    logo_url: row.logo_url,
+    updated_at: new Date(row.updated_at).toISOString(),
+    updated_by: row.updated_by,
+    modules: row.modules ?? {},
+    trial_ends_at: isoOrNull(row.trial_ends_at),
+    suspended_at: isoOrNull(row.suspended_at),
+    account_status: row.account_status,
+  };
+}
+
+export async function getStoreProfile(): Promise<StoreProfileRow> {
+  const row = await StoreProfile.findByPk(1);
+  if (!row) {
     throw new ApiError('INTERNAL_ERROR', 'Profil toko belum diinisialisasi (jalankan migrasi)');
   }
-  return res.rows[0];
+  return toStoreProfileRow(row);
 }
 
 export interface StoreProfileInput {
@@ -33,46 +83,47 @@ export interface StoreProfileInput {
   logo_url?: string | null;
 }
 
-/** Update profil toko (OWNER only di route). */
-export async function updateStoreProfile(input: StoreProfileInput, userId: number): Promise<StoreProfile> {
-  return withTx(async (client) => {
-    const sets: string[] = [];
-    const args: unknown[] = [];
-    const push = (col: string, value: unknown) => {
-      args.push(value);
-      sets.push(`${col} = $${args.length}`);
-    };
+/** Update profil toko (KASIR only di route; OWNER -> 403 FORBIDDEN). */
+export async function updateStoreProfile(input: StoreProfileInput, userId: number): Promise<StoreProfileRow> {
+  const values: Record<string, unknown> = {};
+  if (input.name !== undefined) values.name = input.name;
+  if (input.address !== undefined) values.address = input.address;
+  if (input.phone !== undefined) values.phone = input.phone;
+  if (input.email !== undefined) values.email = input.email;
+  if (input.npwp !== undefined) values.npwp = input.npwp;
+  if (input.receipt_footer !== undefined) values.receipt_footer = input.receipt_footer;
+  if (input.logo_url !== undefined) values.logo_url = input.logo_url;
 
-    if (input.name !== undefined) push('name', input.name);
-    if (input.address !== undefined) push('address', input.address);
-    if (input.phone !== undefined) push('phone', input.phone);
-    if (input.email !== undefined) push('email', input.email);
-    if (input.npwp !== undefined) push('npwp', input.npwp);
-    if (input.receipt_footer !== undefined) push('receipt_footer', input.receipt_footer);
-    if (input.logo_url !== undefined) push('logo_url', input.logo_url);
+  if (Object.keys(values).length === 0) {
+    throw new ApiError('VALIDATION_ERROR', 'Tidak ada kolom yang akan diubah');
+  }
 
-    if (sets.length === 0) {
-      throw new ApiError('VALIDATION_ERROR', 'Tidak ada kolom yang akan diubah');
-    }
-
-    sets.push('updated_at = now()');
-    args.push(userId);
-    const res = await client.query(
-      `UPDATE store_profile SET ${sets.join(', ')}, updated_by = $${args.length} WHERE id = 1 RETURNING id`,
-      args,
-    );
-    if (res.rowCount === 0) throw new ApiError('INTERNAL_ERROR', 'Profil toko belum diinisialisasi');
-
-    // Baca baris TERBARU di transaksi yang sama (bukan via pool: belum commit -> tak terlihat).
-    const row = await client.query<StoreProfile>(`SELECT * FROM store_profile WHERE id = 1`);
-    return row.rows[0]!;
-  }, 'store-update');
+  // `updated_at` disentuh Sequelize otomatis (model memakai timestamps).
+  return withRetry(
+    () =>
+      sequelize.transaction(async (transaction) => {
+        const [updated] = await StoreProfile.update(
+          { ...values, updated_by: userId },
+          { where: { id: 1 }, transaction },
+        );
+        if (updated !== 1) {
+          throw new ApiError('INTERNAL_ERROR', 'Profil toko belum diinisialisasi');
+        }
+        // Baca baris TERBARU di transaksi yang sama (belum commit -> tak terlihat dari luar).
+        const row = await StoreProfile.findByPk(1, { transaction });
+        if (!row) {
+          throw new ApiError('INTERNAL_ERROR', 'Profil toko belum diinisialisasi');
+        }
+        return toStoreProfileRow(row);
+      }),
+    'store-update',
+  );
 }
 
 /* ====================== NOTA / RECEIPT (JSON untuk frontend) ====================== */
 
 export interface Receipt {
-  store: StoreProfile;
+  store: StoreProfileRow;
   sale: {
     sale_no: string;
     sale_date: string;
