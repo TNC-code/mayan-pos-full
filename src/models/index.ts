@@ -9,6 +9,11 @@ import { initCustomer, Customer } from './customer.model.js';
 import { initPaymentMethod, PaymentMethod } from './payment-method.model.js';
 import { initStockBatch, StockBatch } from './stock-batch.model.js';
 import { initStockMovement, StockMovement } from './stock-movement.model.js';
+import { initSale, Sale } from './sale.model.js';
+import { initSaleItem, SaleItem } from './sale-item.model.js';
+import { initPayment, Payment } from './payment.model.js';
+import { initRefund, Refund } from './refund.model.js';
+import { initRefundItem, RefundItem } from './refund-item.model.js';
 import { initStoreProfile, StoreProfile } from './store-profile.model.js';
 import { initIdempotencyKey, IdempotencyKey } from './idempotency-key.model.js';
 
@@ -25,7 +30,8 @@ import { initIdempotencyKey, IdempotencyKey } from './idempotency-key.model.js';
  *    (src/db/sequelize.ts) mengembalikannya sebagai NUMBER agar JSON sama dengan
  *    jalur raw SQL lama; `FLOAT/REAL` DILARANG untuk uang.
  *  - `timestamps` per tabel: `false` untuk tabel tanpa kolom waktu
- *    (user_account, product_category, product_type, customer),
+ *    (user_account, product_category, product_type, customer, refunds,
+ *    refund_items),
  *    `updatedAt: false` untuk tabel yang hanya punya `created_at`
  *    (stock_movements, refresh_tokens, idempotency_keys), `createdAt: false` untuk
  *    `store_profile` (hanya `updated_at`).
@@ -50,6 +56,11 @@ export function initModels(instance: Sequelize = sequelize): void {
   initPaymentMethod(instance);
   initStockBatch(instance);
   initStockMovement(instance);
+  initSale(instance);
+  initSaleItem(instance);
+  initPayment(instance);
+  initRefund(instance);
+  initRefundItem(instance);
   initStoreProfile(instance);
   initIdempotencyKey(instance);
   initialized = true;
@@ -70,8 +81,10 @@ export function associate(): void {
   ProductCategory.belongsTo(ProductType, { foreignKey: 'id_type', as: 'type' });
   ProductType.hasMany(ProductCategory, { foreignKey: 'id_type', as: 'categories' });
 
-  // Customer <-> Sales ditunda ke MP-4.1 (butuh `sale.model.ts`); sementara ini
-  // `sales.customer_id` dibaca lewat kolom FK langsung, sama seperti versi raw SQL.
+  // Customer <-> Sales (MP-4.1). Dipakai `GET /sales` & `GET /sales/:id`
+  // untuk nama/alamat customer pada response (sebelumnya JOIN di raw SQL).
+  Customer.hasMany(Sale, { foreignKey: 'customer_id', as: 'sales' });
+  Sale.belongsTo(Customer, { foreignKey: 'customer_id', as: 'customer' });
 
   /* ------------------------- stok & pembelian (MP-3) -------------------------
    * Alias dipilih agar tidak menabrak nama kolom FK yang sama persis
@@ -97,6 +110,39 @@ export function associate(): void {
 
   StockMovement.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
 
+  /* --------------------- transaksi penjualan (MP-4) ---------------------
+   * Alias `creator` dipakai ulang agar tidak menabrak nama kolom FK
+   * `created_by` di `dataValues` (lihat catatan stok di atas).
+   *
+   * PENTING: `PaymentMethod` punya default scope `is_active = true`, sedangkan
+   * JOIN lama `JOIN payment_methods m ON m.id = p.method_id` TIDAK memfilternya
+   * -> riwayat pembayaran/refund metode yang lalu dinonaktifkan tetap harus
+   * terbaca. Semua include `method` wajib lewat `PaymentMethod.scope('withInactive')`
+   * (sudah diterapkan di `sale.service.ts`).
+   */
+  Sale.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+  Sale.belongsTo(UserAccount, { foreignKey: 'voided_by', as: 'voidedBy' });
+
+  Sale.hasMany(SaleItem, { foreignKey: 'sale_id', as: 'items' });
+  SaleItem.belongsTo(Sale, { foreignKey: 'sale_id', as: 'sale' });
+
+  SaleItem.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
+  SaleItem.belongsTo(StockBatch, { foreignKey: 'batch_id', as: 'batch' });
+
+  Sale.hasMany(Payment, { foreignKey: 'sale_id', as: 'payments' });
+  Payment.belongsTo(Sale, { foreignKey: 'sale_id', as: 'sale' });
+  Payment.belongsTo(PaymentMethod, { foreignKey: 'method_id', as: 'method' });
+  Payment.belongsTo(UserAccount, { foreignKey: 'received_by', as: 'receiver' });
+
+  Sale.hasMany(Refund, { foreignKey: 'sale_id', as: 'refunds' });
+  Refund.belongsTo(Sale, { foreignKey: 'sale_id', as: 'sale' });
+  Refund.belongsTo(PaymentMethod, { foreignKey: 'method_id', as: 'method' });
+  Refund.belongsTo(UserAccount, { foreignKey: 'refunded_by', as: 'refunder' });
+
+  Refund.hasMany(RefundItem, { foreignKey: 'refund_id', as: 'items' });
+  RefundItem.belongsTo(Refund, { foreignKey: 'refund_id', as: 'refund' });
+  RefundItem.belongsTo(SaleItem, { foreignKey: 'sale_item_id', as: 'sale_item' });
+
   associated = true;
 }
 
@@ -108,11 +154,16 @@ export { sequelize };
 export {
   Customer,
   IdempotencyKey,
+  Payment,
   PaymentMethod,
   Product,
   ProductCategory,
   ProductType,
   RefreshToken,
+  Refund,
+  RefundItem,
+  Sale,
+  SaleItem,
   StockBatch,
   StockMovement,
   StoreProfile,
@@ -125,6 +176,11 @@ export type { ProductCategoryAttributes } from './product-category.model.js';
 export type { ProductTypeAttributes } from './product-type.model.js';
 export type { CustomerAttributes } from './customer.model.js';
 export type { PaymentMethodAttributes } from './payment-method.model.js';
+export type { SaleAttributes, SaleCreationAttributes, SaleStatus, SalePaymentStatus } from './sale.model.js';
+export type { SaleItemAttributes, SaleItemCreationAttributes } from './sale-item.model.js';
+export type { PaymentAttributes, PaymentCreationAttributes } from './payment.model.js';
+export type { RefundAttributes, RefundCreationAttributes } from './refund.model.js';
+export type { RefundItemAttributes, RefundItemCreationAttributes, ReturnCondition } from './refund-item.model.js';
 export type { IdempotencyKeyAttributes } from './idempotency-key.model.js';
 export type { RefreshTokenAttributes } from './refresh-token.model.js';
 export type { StoreProfileAttributes } from './store-profile.model.js';

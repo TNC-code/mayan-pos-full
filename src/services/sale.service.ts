@@ -1,14 +1,52 @@
-import type { PoolClient } from 'pg';
-import { pool } from '../config/db.js';
+import { Op, QueryTypes, Sequelize, type Includeable, type Transaction } from 'sequelize';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/errors.js';
-import { round2, round3, withTx } from '../utils/tx.js';
+import { round2, round3, withOrmTx } from '../utils/tx.js';
+import { mapOrmError } from '../utils/orm-errors.js';
+import {
+  Customer,
+  Payment,
+  PaymentMethod,
+  Product,
+  Refund,
+  RefundItem,
+  Sale,
+  SaleItem,
+  StockBatch,
+  StockMovement,
+  UserAccount,
+  sequelize,
+} from '../models/index.js';
 import { nextDocNo } from './docno.js';
-import { runIdempotent } from './idempotency.service.js';
+import { runOrmIdempotent } from './idempotency.service.js';
 
-/* ============================== types ============================== */
+/**
+ * Penjualan di atas Sequelize (MP-4) — paritas penuh dengan versi raw SQL lama
+ * (`git show e33b3b5:src/services/sale.service.ts`, dipindahkan tanpa mengubah
+ * bentuk response).
+ *
+ * Yang TETAP milik trigger DB (tidak digandakan di sini, plan §D3):
+ *  - `trg_sale_item_validate`: batch wajib + lock `FOR UPDATE`, `unit_price >=
+ *    unit_cost`, `qty_remaining >= qty`, dan **menimpa `unit_cost` dengan harga
+ *    beli batch** (snapshot HPP);
+ *  - `trg_sale_item_apply_movement`: movement `OUT` per item (stok turun via
+ *    `trg_stock_movement_apply` — aplikasi tidak pernah menghitung stok);
+ *  - `trg_payments_validate` / `trg_payments_sync_status`: metode aktif,
+ *    `reference_no`, anti-overpay, dan penulisan `payment_status`;
+ *  - `trg_sales_void`: transisi status + metadata void; `fn_sales_void_apply`
+ *    sengaja PASIF — stok balik ditulis SATU PENULIS di service ini
+ *    (`insertReturnMovements`, movement `IN` berlabel GOOD/RUSAK).
+ *
+ * Yang DITAMBAHkan lapisan aplikasi (validasi ramah ber-`ApiError`, kode error
+ * sama dengan yang akan muncul dari trigger):
+ *  - alokasi batch: eksplisit dari kasir ATAU auto-FIFO (expired ASC NULLS LAST,
+ *    id ASC) dengan `FOR UPDATE` — menutup race 2 kasir sebelum trigger bekerja;
+ *  - `PRICE_BELOW_COST` / `INSUFFICIENT_STOCK` / `PAYMENT_OVER_TOTAL` checked
+ *    sebelum INSERT, jadi kasir dapat pesan jelas (bukan 500 dari trigger);
+ *  - `PAYMENT_METHOD_INACTIVE` / `PAYMENT_METHOD_NOT_FOUND` /
+ *    `REFERENCE_NO_REQUIRED` untuk metode pembayaran.
+ */
 
-/** Kondisi barang saat kembali ke gudang: GOOD (bisa dijual lagi) / RUSAK (karantina). */
 export type StockCondition = 'GOOD' | 'RUSAK';
 
 export interface SaleRow {
@@ -142,49 +180,153 @@ export interface RefundInput {
   items?: RefundItemInput[];
 }
 
-/* ============================ selectors ============================ */
+/* ============================== include ============================== */
 
-const SELECT_SALE = `
-  SELECT s.id, s.sale_no, s.customer_id, c.name AS customer_name, c.address AS customer_address,
-         s.total_amount, s.tax_amount, s.status,
-         s.payment_status, s.sale_date, s.note, s.created_by, u.username AS created_by_name,
-         s.voided_at, s.voided_by, s.void_reason, s.is_test
-    FROM sales s
-    LEFT JOIN customer c ON c.id = s.customer_id
-    LEFT JOIN user_account u ON u.id = s.created_by
-`;
+/**
+ * `Product` punya default scope `is_active = true` (soft delete) sedangkan
+ * JOIN lama tidak memfilternya -> penjualan produk nonaktif tetap harus terbaca.
+ * `PaymentMethod` default-nya `is_active = true`; riwayat bayar/refund metode
+ * yang lalu dinonaktifkan juga harus terbaca -> dua-duanya lewat scope.
+ */
+const INCLUDE_CUSTOMER: Includeable = {
+  model: Customer,
+  as: 'customer',
+  attributes: ['id', 'name', 'address'],
+  required: false,
+};
 
-const SELECT_REFUND = `
-  SELECT r.id, r.sale_id, r.method_id, m.code AS method_code, r.amount, r.reason,
-         r.refunded_at, r.refunded_by, u.username AS refunded_by_name
-    FROM refunds r
-    LEFT JOIN payment_methods m ON m.id = r.method_id
-    LEFT JOIN user_account u ON u.id = r.refunded_by
-`;
+const INCLUDE_CREATOR: Includeable = {
+  model: UserAccount,
+  as: 'creator',
+  attributes: ['id', 'username'],
+  required: false,
+};
 
-const SELECT_REFUND_ITEM = `
-  SELECT ri.id, ri.refund_id, ri.sale_item_id, ri.qty, ri.condition, ri.unit_price, ri.subtotal
-    FROM refund_items ri
-`;
+const INCLUDE_METHOD: Includeable = {
+  model: PaymentMethod.scope('withInactive'),
+  as: 'method',
+  attributes: ['id', 'code', 'name'],
+  required: false,
+};
 
-const SELECT_PAYMENT = `
-  SELECT p.id, p.sale_id, p.method_id, m.code AS method_code, m.name AS method_name,
-         p.amount, p.tendered_amount, p.change_amount, p.reference_no, p.paid_at,
-         p.received_by, u.username AS received_by_name, p.notes
-    FROM payments p
-    JOIN payment_methods m ON m.id = p.method_id
-    LEFT JOIN user_account u ON u.id = p.received_by
-`;
+const SALE_INCLUDES: Includeable[] = [INCLUDE_CUSTOMER, INCLUDE_CREATOR];
 
-const SELECT_ITEM = `
-  SELECT si.id, si.sale_id, si.product_id, pr.name AS product_name, pr.unit, si.batch_id,
-         b.batch_code, si.qty, si.unit_price, si.unit_cost, si.subtotal, si.note
-    FROM sale_items si
-    JOIN product pr ON pr.id = si.product_id
-    LEFT JOIN stock_batches b ON b.id = si.batch_id
-`;
+const ITEM_INCLUDES: Includeable[] = [
+  { model: Product.scope('withInactive'), as: 'product', attributes: ['id', 'name', 'unit'], required: true },
+  { model: StockBatch, as: 'batch', attributes: ['id', 'batch_code'], required: false },
+];
 
-export async function listSales(params: {
+const PAYMENT_INCLUDES: Includeable[] = [
+  INCLUDE_METHOD,
+  { model: UserAccount, as: 'receiver', attributes: ['id', 'username'], required: false },
+];
+
+const REFUND_INCLUDES: Includeable[] = [
+  INCLUDE_METHOD,
+  { model: UserAccount, as: 'refunder', attributes: ['id', 'username'], required: false },
+];
+
+/* ============================== mapper ============================== */
+
+type SaleWithRefs = Sale & {
+  customer?: { id: number; name: string | null; address: string | null } | null;
+  creator?: { id: number; username: string } | null;
+};
+
+type SaleItemWithRefs = SaleItem & {
+  product?: { id: number; name: string | null; unit: string | null } | null;
+  batch?: { id: number; batch_code: string | null } | null;
+};
+
+type PaymentWithRefs = Payment & {
+  method?: { id: number; code: string; name: string } | null;
+  receiver?: { id: number; username: string } | null;
+};
+
+type RefundWithRefs = Refund & {
+  method?: { id: number; code: string; name: string } | null;
+  refunder?: { id: number; username: string } | null;
+};
+
+/** `timestamptz` -> string ISO (JSON `Date` otomatis sama seperti jalur raw SQL). */
+function iso(value: Date | null): string | null {
+  return value === null ? null : new Date(value).toISOString();
+}
+
+function toSaleRow(row: SaleWithRefs): SaleRow {
+  return {
+    id: row.id,
+    sale_no: row.sale_no,
+    customer_id: row.customer_id,
+    customer_name: row.customer?.name ?? null,
+    customer_address: row.customer?.address ?? null,
+    total_amount: row.total_amount,
+    tax_amount: row.tax_amount,
+    status: row.status,
+    payment_status: row.payment_status,
+    sale_date: new Date(row.sale_date).toISOString(),
+    note: row.note,
+    created_by: row.created_by,
+    created_by_name: row.creator?.username ?? null,
+    voided_at: iso(row.voided_at),
+    voided_by: row.voided_by,
+    void_reason: row.void_reason,
+    is_test: row.is_test,
+  };
+}
+
+function toSaleItemRow(row: SaleItemWithRefs): SaleItemRow {
+  return {
+    id: row.id,
+    sale_id: row.sale_id,
+    product_id: row.product_id,
+    product_name: row.product?.name ?? null,
+    unit: row.product?.unit ?? null,
+    batch_id: row.batch_id,
+    batch_code: row.batch?.batch_code ?? null,
+    qty: row.qty,
+    unit_price: row.unit_price,
+    unit_cost: row.unit_cost,
+    subtotal: row.subtotal,
+    note: row.note,
+  };
+}
+
+function toPaymentRow(row: PaymentWithRefs): PaymentRow {
+  return {
+    id: row.id,
+    sale_id: row.sale_id,
+    method_id: row.method_id,
+    method_code: row.method?.code ?? '',
+    method_name: row.method?.name ?? '',
+    amount: row.amount,
+    tendered_amount: row.tendered_amount,
+    change_amount: row.change_amount,
+    reference_no: row.reference_no,
+    paid_at: new Date(row.paid_at).toISOString(),
+    received_by: row.received_by,
+    received_by_name: row.receiver?.username ?? null,
+    notes: row.notes,
+  };
+}
+
+function toRefundRow(row: RefundWithRefs): RefundRow {
+  return {
+    id: row.id,
+    sale_id: row.sale_id,
+    method_id: row.method_id,
+    method_code: row.method?.code ?? null,
+    amount: row.amount,
+    reason: row.reason,
+    refunded_at: new Date(row.refunded_at).toISOString(),
+    refunded_by: row.refunded_by,
+    refunded_by_name: row.refunder?.username ?? null,
+  };
+}
+
+/* ============================ daftar penjualan ============================ */
+
+export interface SaleListQuery {
   date_from?: string;
   date_to?: string;
   payment_status?: string;
@@ -194,86 +336,118 @@ export async function listSales(params: {
   include_test?: boolean;
   limit: number;
   offset: number;
-}): Promise<SaleRow[]> {
-  const args: unknown[] = [];
-  const where: string[] = [];
-  const tz = env.businessTz;
-
-  // Default: data uji TIDAK ikut laporan/daftar produksi (P0 marking).
-  if (!params.include_test) {
-    where.push('s.is_test = false');
-  }
-
-  // Filter tanggal memakai zona waktu bisnis; jam absolut tetap milik DB.
-  if (params.date_from) {
-    args.push(tz);
-    const tzIdx = args.length;
-    args.push(params.date_from);
-    where.push(`(s.sale_date AT TIME ZONE $${tzIdx})::date >= $${args.length}::date`);
-  }
-  if (params.date_to) {
-    args.push(tz);
-    const tzIdx = args.length;
-    args.push(params.date_to);
-    where.push(`(s.sale_date AT TIME ZONE $${tzIdx})::date <= $${args.length}::date`);
-  }
-  if (params.payment_status) {
-    args.push(params.payment_status);
-    where.push(`s.payment_status = $${args.length}`);
-  }
-  if (params.status) {
-    args.push(params.status);
-    where.push(`s.status = $${args.length}`);
-  }
-  if (params.customer_id !== undefined) {
-    args.push(params.customer_id);
-    where.push(`s.customer_id = $${args.length}`);
-  }
-  if (params.q) {
-    args.push(`%${params.q}%`);
-    where.push(`s.sale_no ILIKE $${args.length}`);
-  }
-
-  args.push(params.limit, params.offset);
-  const res = await pool.query<SaleRow>(
-    `${SELECT_SALE} ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
-     ORDER BY s.id DESC LIMIT $${args.length - 1} OFFSET $${args.length}`,
-    args as never[],
-  );
-  return res.rows;
 }
 
-async function fetchDetail(client: PoolClient | null, id: number): Promise<SaleDetail> {
-  const runner = client ? client.query.bind(client) : pool.query.bind(pool);
+/**
+ * `GET /sales` — daftar penjualan (default `id DESC`).
+ *
+ * Filter tanggal memakai zona waktu bisnis seperti versi lama:
+ * `(sale_date AT TIME ZONE $tz)::date >= $date_from`. `$tz` berasal dari env
+ * (bukan input user) dan tetap di-escape lewat `sequelize.escape`.
+ *
+ * Default: baris `is_test = true` disembunyikan (P0 marking) — termasuk dengan
+ * `?include_test=true`.
+ */
+export async function listSales(params: SaleListQuery): Promise<SaleRow[]> {
+  const conditions: Record<string, unknown>[] = [];
 
-  const saleRes = await runner(`${SELECT_SALE} WHERE s.id = $1`, [id]);
-  const sale = saleRes.rows[0] as SaleRow | undefined;
+  if (!params.include_test) conditions.push({ is_test: false });
+
+  const tzLiteral = sequelize.escape(env.businessTz);
+  const localDate = (op: '>=' | '<=', value: string): ReturnType<typeof Sequelize.literal> =>
+    Sequelize.literal(`(sale_date AT TIME ZONE ${tzLiteral})::date ${op} ${sequelize.escape(value)}`);
+  if (params.date_from) conditions.push(localDate('>=', params.date_from) as never);
+  if (params.date_to) conditions.push(localDate('<=', params.date_to) as never);
+
+  if (params.payment_status) conditions.push({ payment_status: params.payment_status });
+  if (params.status) conditions.push({ status: params.status });
+  if (params.customer_id !== undefined) conditions.push({ customer_id: params.customer_id });
+  if (params.q) conditions.push({ sale_no: { [Op.iLike]: `%${params.q}%` } });
+
+  const rows = await Sale.findAll({
+    where: { [Op.and]: conditions },
+    include: SALE_INCLUDES,
+    // Semua include 1:1 (belongsTo) -> jumlah baris tidak berubah, LIMIT aman.
+    subQuery: false,
+    order: [['id', 'DESC']],
+    limit: params.limit,
+    offset: params.offset,
+  });
+
+  return (rows as unknown as SaleWithRefs[]).map(toSaleRow);
+}
+
+/* ============================== detail ============================== */
+
+/**
+ * Header + item + payment + refund satu penjualan.
+ * Boleh dipanggil dalam transaksi (semua query membawa `transaction`), supaya
+ * `createSale`/`voidSale`/`refundSale` bisa mengembalikan detail yang SUDAH
+ * memasukkan efek baris yang baru ditulis.
+ */
+async function fetchDetail(transaction: Transaction | null, id: number): Promise<SaleDetail> {
+  const sale = await Sale.findByPk(id, { include: SALE_INCLUDES, transaction });
   if (!sale) {
     throw new ApiError('NOT_FOUND', `Penjualan id=${id} tidak ditemukan`);
   }
 
-  const [items, payments, paid, refundedSum, refundRows, refundItemRows] = await Promise.all([
-    runner(`${SELECT_ITEM} WHERE si.sale_id = $1 ORDER BY si.id ASC`, [id]),
-    runner(`${SELECT_PAYMENT} WHERE p.sale_id = $1 ORDER BY p.id ASC`, [id]),
-    runner(`SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS paid FROM payments WHERE sale_id = $1`, [id]),
-    runner(`SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS refunded FROM refunds WHERE sale_id = $1`, [id]),
-    runner(`${SELECT_REFUND} WHERE r.sale_id = $1 ORDER BY r.id ASC`, [id]),
-    runner(
-      `${SELECT_REFUND_ITEM} WHERE ri.refund_id IN (SELECT id FROM refunds WHERE sale_id = $1) ORDER BY ri.id ASC`,
-      [id],
-    ),
-  ]);
+  const items = await SaleItem.findAll({
+    where: { sale_id: id },
+    include: ITEM_INCLUDES,
+    subQuery: false,
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  const payments = await Payment.findAll({
+    where: { sale_id: id },
+    include: PAYMENT_INCLUDES,
+    subQuery: false,
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  const refunds = await Refund.findAll({
+    where: { sale_id: id },
+    include: REFUND_INCLUDES,
+    subQuery: false,
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  const refundItems = await RefundItem.findAll({
+    include: [
+      {
+        model: Refund,
+        as: 'refund',
+        attributes: [],
+        required: true,
+        where: { sale_id: id },
+      },
+    ],
+    subQuery: false,
+    order: [['id', 'ASC']],
+    transaction,
+  });
 
-  const paidAmount = Number(paid.rows[0]?.paid ?? 0);
-  const refundedAmount = Number(refundedSum.rows[0]?.refunded ?? 0);
-  const dueAmount = sale.status === 'COMPLETED' ? round2(sale.total_amount - paidAmount) : 0;
+  const base = toSaleRow(sale as SaleWithRefs);
+  const paidAmount = round2(
+    payments.reduce((sum, p) => sum + Number(p.amount), 0),
+  );
+  const refundedAmount = round2(refunds.reduce((sum, r) => sum + Number(r.amount), 0));
+  const dueAmount = base.status === 'COMPLETED' ? round2(base.total_amount - paidAmount) : 0;
 
   return {
-    ...sale,
-    items: items.rows as SaleItemRow[],
-    payments: payments.rows as PaymentRow[],
-    refunds: refundRows.rows as RefundRow[],
-    refund_items: refundItemRows.rows as RefundItemRow[],
+    ...base,
+    items: (items as unknown as SaleItemWithRefs[]).map(toSaleItemRow),
+    payments: (payments as unknown as PaymentWithRefs[]).map(toPaymentRow),
+    refunds: (refunds as unknown as RefundWithRefs[]).map(toRefundRow),
+    refund_items: refundItems.map((r) => ({
+      id: r.id,
+      refund_id: r.refund_id,
+      sale_item_id: r.sale_item_id,
+      qty: r.qty,
+      condition: r.condition,
+      unit_price: r.unit_price,
+      subtotal: r.subtotal,
+    })),
     paid_amount: paidAmount,
     refunded_amount: refundedAmount,
     due_amount: dueAmount < 0 ? 0 : dueAmount,
@@ -284,47 +458,68 @@ export async function getSale(id: number): Promise<SaleDetail> {
   return fetchDetail(null, id);
 }
 
-/* ====================== pemilihan batch (auto FIFO) ====================== */
+/* ==================== pemilihan batch (auto-FIFO, terkunci) ==================== */
 
 /**
- * Batch eksplisit dari kasir, atau auto-FIFO:
- * batch aktif dengan qty_remaining > 0, diurutkan expired_date NULLS LAST lalu id.
- * Pengecekan qty/harga TIDAK diulang di sini - trigger fn_sale_item_validate yang
- * mengunci baris (SELECT ... FOR UPDATE) dan menolaknya.
+ * Batch eksplisit dari kasir, atau auto-FIFO: batch dengan `qty_remaining > 0`
+ * diurutkan `expired_date ASC NULLS LAST` lalu `id ASC` (batch paling lama/
+ * paling cepat kedaluwarsa dulu).
+ *
+ * Baris batch dikunci `FOR UPDATE` di dalam transaksi yang sama dengan INSERT
+ * `sale_items`, jadi 2 kasir selling produk yang sama TIDAK bisa menghitung
+ * stok dari snapshot yang sama: kasir kedua menunggu, lalu membaca ulang baris
+ * post-commit (READ COMMITTED + EvalPlanQual) sebelum INSERT. Stok & harga
+ * tetap divalidasi ulang oleh trigger — pemindaian di sini hanya untuk pesan
+ * error yang ramah.
  */
-async function resolveBatchId(client: PoolClient, item: SaleInputItem): Promise<number> {
-  if (item.batch_id) return item.batch_id;
+async function resolveBatch(
+  transaction: Transaction,
+  item: SaleInputItem,
+): Promise<StockBatch> {
+  if (item.batch_id) {
+    const batch = await StockBatch.findByPk(item.batch_id, { transaction, lock: transaction.LOCK.UPDATE });
+    if (!batch) {
+      throw new ApiError('BATCH_NOT_FOUND', `Batch id=${item.batch_id} tidak ditemukan`);
+    }
+    if (batch.product_id !== item.product_id) {
+      throw new ApiError(
+        'VALIDATION_ERROR',
+        `Batch ${batch.batch_code} bukan batch produk id=${item.product_id} — pilih batch dari daftar batch produk tersebut`,
+      );
+    }
+    return batch;
+  }
 
-  const res = await client.query<{ id: number }>(
-    `SELECT id
-       FROM stock_batches
-      WHERE product_id = $1 AND qty_remaining > 0
-      ORDER BY expired_date ASC NULLS LAST, id ASC
-      LIMIT 1`,
-    [item.product_id],
-  );
-
-  if (!res.rows[0]) {
+  const batch = await StockBatch.findOne({
+    where: { product_id: item.product_id, qty_remaining: { [Op.gt]: 0 } },
+    order: [
+      ['expired_date', 'ASC'], // Postgres: NULLS LAST adalah default untuk ASC
+      ['id', 'ASC'],
+    ],
+    transaction,
+    lock: transaction.LOCK.UPDATE,
+  });
+  if (!batch) {
     throw new ApiError(
       'INSUFFICIENT_STOCK',
       `Stok tidak cukup untuk produk id=${item.product_id}: tidak ada batch aktif dengan stok tersisa`,
     );
   }
-  return res.rows[0].id;
+  return batch;
 }
 
 /* ====================== validasi method (level API) ====================== */
 
 /**
- * Side API untuk aturan yang juga dijaga trigger fn_payments_validate, supaya kasir
- * dapat pesan yang jelas sebelum DB menolak. DB tetap penjaga terakhirnya.
+ * Side API untuk aturan yang juga dijaga trigger `fn_payments_validate`,
+ * supaya kasir dapat pesan jelas sebelum DB menolak. DB tetap penjaga terakhirnya.
  */
-async function assertMethodUsable(client: PoolClient, methodId: number, referenceNo?: string | null): Promise<{ code: string; requires_reference: boolean }> {
-  const res = await client.query<{ code: string; is_active: boolean; requires_reference: boolean }>(
-    `SELECT code, is_active, requires_reference FROM payment_methods WHERE id = $1`,
-    [methodId],
-  );
-  const m = res.rows[0];
+async function assertMethodUsable(
+  transaction: Transaction,
+  methodId: number,
+  referenceNo?: string | null,
+): Promise<{ code: string; requires_reference: boolean }> {
+  const m = await PaymentMethod.scope('withInactive').findByPk(methodId, { transaction });
   if (!m) throw new ApiError('PAYMENT_METHOD_NOT_FOUND', `Metode pembayaran id=${methodId} tidak ditemukan`);
   if (!m.is_active) throw new ApiError('PAYMENT_METHOD_INACTIVE', 'Metode pembayaran tidak aktif');
   if (m.requires_reference && (referenceNo === undefined || referenceNo === null || referenceNo.trim() === '')) {
@@ -334,12 +529,12 @@ async function assertMethodUsable(client: PoolClient, methodId: number, referenc
 }
 
 async function insertPayment(
-  client: PoolClient,
+  transaction: Transaction,
   saleId: number,
   payment: SalePaymentInput,
   receivedBy: number | null,
-): Promise<PaymentRow> {
-  await assertMethodUsable(client, payment.method_id, payment.reference_no);
+): Promise<Payment> {
+  await assertMethodUsable(transaction, payment.method_id, payment.reference_no);
 
   // CASH: uang diterima boleh lebih besar (kembalian = generated column change_amount).
   // Metode non-CASH: nominal yang diterima = amount.
@@ -350,15 +545,20 @@ async function insertPayment(
     throw new ApiError('VALIDATION_ERROR', 'tendered_amount tidak boleh lebih kecil dari amount');
   }
 
-  const res = await client.query<{ id: number }>(
-    `INSERT INTO payments (sale_id, method_id, amount, tendered_amount, reference_no, notes, received_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     RETURNING id`,
-    [saleId, payment.method_id, payment.amount, tendered, payment.reference_no ?? null, payment.notes ?? null, receivedBy],
+  // `payment_status` TIDAK ikut ditulis: trigger trg_payments_sync_status yang
+  // menghitungnya dari total pembayaran.
+  return Payment.create(
+    {
+      sale_id: saleId,
+      method_id: payment.method_id,
+      amount: payment.amount,
+      tendered_amount: tendered,
+      reference_no: payment.reference_no ?? null,
+      notes: payment.notes ?? null,
+      received_by: receivedBy,
+    },
+    { transaction },
   );
-
-  const pay = await client.query(`${SELECT_PAYMENT} WHERE p.id = $1`, [res.rows[0]!.id]);
-  return pay.rows[0] as PaymentRow;
 }
 
 /* ====================== konversi satuan jual (P2) ====================== */
@@ -369,16 +569,12 @@ async function insertPayment(
  * dan unit_price diskalakan per satuan dasar (harga input = harga per satuan ALT).
  */
 async function resolveQtyPriceNote(
-  client: PoolClient,
+  transaction: Transaction,
   item: SaleInputItem,
 ): Promise<{ qty: number; unitPrice: number; note: string | null }> {
   if (!item.unit) return { qty: item.qty, unitPrice: item.unit_price, note: item.note ?? null };
 
-  const res = await client.query<{ unit: string; unit_conversions: Record<string, number> | null }>(
-    `SELECT unit, unit_conversions FROM product WHERE id = $1`,
-    [item.product_id],
-  );
-  const p = res.rows[0];
+  const p = await Product.scope('withInactive').findByPk(item.product_id, { transaction });
   if (!p) throw new ApiError('NOT_FOUND', `Produk id=${item.product_id} tidak ditemukan`);
   if (item.unit === p.unit) return { qty: item.qty, unitPrice: item.unit_price, note: item.note ?? null };
 
@@ -397,7 +593,7 @@ async function resolveQtyPriceNote(
   };
 }
 
-/* ====================== POST /sales (FASE 3) ====================== */
+/* ====================== POST /sales (checkout) ====================== */
 
 /**
  * POS checkout = SATU transaksi DB:
@@ -407,113 +603,195 @@ async function resolveQtyPriceNote(
  *          -> COMMIT
  * Gagal di tengah = ROLLBACK total (tidak ada sales yatim, stok tidak berkurang).
  * Dilingkupi Idempotency-Key agar retry multi-POS tidak menghasilkan 2 transaksi.
+ *
+ * `Idempotency-Key` WAJIB (middleware `requireIdempotencyKey`): retry dengan
+ * key sama -> 200 + header `Idempotency-Replayed` + body identik (controller),
+ * tanpa membuat transaksi kedua.
  */
-export async function createSale(input: SaleInput, userId: number, idempotencyKey: string): Promise<{ sale: SaleDetail; replayed: boolean }> {
-  const result = await runIdempotent<SaleDetail>('POST /sales', idempotencyKey, async (client) => {
-    if (input.customer_id !== undefined && input.customer_id !== null) {
-      const c = await client.query(`SELECT 1 FROM customer WHERE id = $1`, [input.customer_id]);
-      if (c.rowCount === 0) {
-        throw new ApiError('VALIDATION_ERROR', `Customer id=${input.customer_id} tidak ditemukan`);
+export async function createSale(
+  input: SaleInput,
+  userId: number,
+  idempotencyKey: string,
+): Promise<{ sale: SaleDetail; replayed: boolean }> {
+  try {
+    const result = await runOrmIdempotent<SaleDetail>('POST /sales', idempotencyKey, async (transaction) => {
+      // Kasbon (tanpa pembayaran awal) wajib atas nama customer — piutang tanpa
+      // nama tidak bisa ditagih (menu-matrix.md §8; zod juga menolak, ini jaring
+      // kedua untuk pemanggil internal seperti konversi order-book MP-7).
+      if (input.payment == null && (input.customer_id === undefined || input.customer_id === null)) {
+        throw new ApiError(
+          'VALIDATION_ERROR',
+          'Penjualan tanpa pembayaran awal (kasbon) wajib menyertakan customer_id',
+        );
       }
-    }
 
-    // Total dihitung dari request (bukan dari stok), lalu dikoreksi ke subtotal
-    // stored generated column DB sebelum commit.
-    const estimatedTotal = round2(input.items.reduce((sum, it) => sum + it.qty * it.unit_price, 0));
+      if (input.customer_id !== undefined && input.customer_id !== null) {
+        const c = await Customer.findByPk(input.customer_id, { attributes: ['id'], transaction });
+        if (!c) {
+          throw new ApiError('VALIDATION_ERROR', `Customer id=${input.customer_id} tidak ditemukan`);
+        }
+      }
 
-    const saleNo = await nextDocNo(client, 'sale', env.businessTz);
-    const saleIns = await client.query<{ id: number }>(
-      `INSERT INTO sales (sale_no, customer_id, total_amount, note, created_by)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [saleNo, input.customer_id ?? null, estimatedTotal, input.note ?? null, userId],
-    );
-    const saleId = saleIns.rows[0]!.id;
+      // Total dihitung dari request (bukan dari stok), lalu dikoreksi ke subtotal
+      // stored generated column DB sebelum commit.
+      const estimatedTotal = round2(input.items.reduce((sum, it) => sum + it.qty * it.unit_price, 0));
 
-    for (const item of input.items) {
-      const batchId = await resolveBatchId(client, item);
-      const { qty, unitPrice, note } = await resolveQtyPriceNote(client, item);
-      // unit_cost diisi 0, ditimpa trigger dengan snapshot harga beli batch.
-      await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, batch_id, qty, unit_price, unit_cost, note)
-         VALUES ($1, $2, $3, $4, $5, 0, $6)`,
-        [saleId, item.product_id, batchId, qty, unitPrice, note],
+      const saleNo = await nextDocNo(transaction, 'sale', env.businessTz);
+      const sale = await Sale.create(
+        {
+          sale_no: saleNo,
+          customer_id: input.customer_id ?? null,
+          total_amount: estimatedTotal,
+          note: input.note ?? null,
+          created_by: userId,
+        },
+        { transaction },
       );
-    }
 
-    // Samakan total dengan subtotal tersimpan di DB (NUMERIC presisi penuh)
-    // lalu tambahkan PPN (P2) bila diisi.
-    const total = await client.query<{ total: number }>(
-      `SELECT COALESCE(sum(subtotal), 0)::numeric(14,2) AS total FROM sale_items WHERE sale_id = $1`,
-      [saleId],
-    );
-    const subtotal = Number(total.rows[0]?.total ?? 0);
-    const taxPercent = input.tax_percent ?? 0;
-    const taxAmount = round2((subtotal * taxPercent) / 100);
-    await client.query(`UPDATE sales SET total_amount = $2, tax_amount = $3 WHERE id = $1`, [
-      saleId,
-      round2(subtotal + taxAmount),
-      taxAmount,
-    ]);
+      for (const item of input.items) {
+        const batch = await resolveBatch(transaction, item);
+        // Validasi ramah (kode error sama dengan hasil trigger), supaya kasir
+        // tidak menerima 500 raw dari PostgreSQL.
+        if (item.unit_price < batch.unit_cost) {
+          throw new ApiError(
+            'PRICE_BELOW_COST',
+            `Harga jual (${item.unit_price}) tidak boleh di bawah harga beli batch ${batch.batch_code} (${batch.unit_cost})`,
+          );
+        }
+        if (batch.qty_remaining < item.qty) {
+          throw new ApiError(
+            'INSUFFICIENT_STOCK',
+            `Stok tidak cukup untuk produk id=${item.product_id}: tersedia ${batch.qty_remaining}, diminta ${item.qty}`,
+          );
+        }
+        const { qty, unitPrice, note } = await resolveQtyPriceNote(transaction, item);
+        // unit_cost diisi 0, ditimpa trigger dengan snapshot harga beli batch.
+        await SaleItem.create(
+          {
+            sale_id: sale.id,
+            product_id: item.product_id,
+            batch_id: batch.id,
+            qty,
+            unit_price: unitPrice,
+            unit_cost: 0,
+            note,
+          },
+          { transaction },
+        );
+      }
 
-    if (input.payment) {
-      await insertPayment(client, saleId, input.payment, userId);
-    }
+      // Samakan total dengan subtotal tersimpan di DB (NUMERIC presisi penuh)
+      // lalu tambahkan PPN (P2) bila diisi.
+      const subtotal = round2(
+        Number(
+          (await SaleItem.sum('subtotal', { where: { sale_id: sale.id }, transaction })) ?? 0,
+        ),
+      );
+      const taxPercent = input.tax_percent ?? 0;
+      const taxAmount = round2((subtotal * taxPercent) / 100);
+      await sale.update(
+        { total_amount: round2(subtotal + taxAmount), tax_amount: taxAmount },
+        { transaction },
+      );
 
-    const detail = await fetchDetail(client, saleId);
-    return { status: 201, body: detail };
-  });
+      if (input.payment) {
+        if (input.payment.amount > sale.total_amount) {
+          throw new ApiError(
+            'PAYMENT_OVER_TOTAL',
+            `Total pembayaran (${input.payment.amount}) melebihi total penjualan (${sale.total_amount})`,
+          );
+        }
+        await insertPayment(transaction, sale.id, input.payment, userId);
+      }
 
-  return { sale: result.body, replayed: result.replayed };
+      const detail = await fetchDetail(transaction, sale.id);
+      return { status: 201, body: detail };
+    });
+
+    return { sale: result.body, replayed: result.replayed };
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
-/* ====================== POST /sales/{id}/payments (FASE 4) ====================== */
+/* ====================== POST /sales/{id}/payments ====================== */
 
+/**
+ * Pembayaran lanjutan (DP / pelunasan). Kunci baris `sales` `FOR UPDATE` dulu:
+ * total & `payment_status` tidak boleh berubah di tengah calculations, dan
+ * insert payment kedua berbaris dengan payment pertama.
+ */
 export async function addPayment(
   saleId: number,
   payment: SalePaymentInput,
   userId: number,
   idempotencyKey: string,
 ): Promise<{ payment: PaymentRow; sale: SaleDetail; replayed: boolean }> {
-  const result = await runIdempotent<{ payment: PaymentRow; sale: SaleDetail }>(
-    'POST /sales/{id}/payments',
-    idempotencyKey,
-    async (client) => {
-      const sale = await client.query<{ id: number; status: string; total_amount: number }>(
-        `SELECT id, status, total_amount FROM sales WHERE id = $1 FOR UPDATE`,
-        [saleId],
-      );
-      if (!sale.rows[0]) {
-        throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
-      }
+  try {
+    const result = await runOrmIdempotent<{ payment: PaymentRow; sale: SaleDetail }>(
+      'POST /sales/{id}/payments',
+      idempotencyKey,
+      async (transaction) => {
+        const sale = await Sale.findByPk(saleId, { transaction, lock: transaction.LOCK.UPDATE });
+        if (!sale) {
+          throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
+        }
+        // Sama dengan guard `fn_payments_sync_status` (tanpa pembayaran tambahan
+        // pada sale VOIDED/RETURNED), tapi dengan pesan yang jelas lebih dulu.
+        if (sale.status !== 'COMPLETED') {
+          throw new ApiError(
+            'PAYMENT_NOT_ALLOWED',
+            `Tidak dapat menambah pembayaran pada penjualan berstatus ${sale.status}`,
+          );
+        }
 
-      const pay = await insertPayment(client, saleId, payment, userId);
-      const detail = await fetchDetail(client, saleId);
-      return { status: 201, body: { payment: pay, sale: detail } };
-    },
-  );
+        const alreadyPaid = round2(
+          Number((await Payment.sum('amount', { where: { sale_id: saleId }, transaction })) ?? 0),
+        );
+        const newPaid = round2(alreadyPaid + payment.amount);
+        if (newPaid > round2(sale.total_amount)) {
+          throw new ApiError(
+            'PAYMENT_OVER_TOTAL',
+            `Total pembayaran (${newPaid}) melebihi total penjualan (${round2(sale.total_amount)})`,
+          );
+        }
 
-  return { ...result.body, replayed: result.replayed };
+        const created = await insertPayment(transaction, saleId, payment, userId);
+        const detail = await fetchDetail(transaction, saleId);
+        const stored = detail.payments.find((p) => p.id === created.id)!;
+        return { status: 201, body: { payment: stored, sale: detail } };
+      },
+    );
+
+    return { ...result.body, replayed: result.replayed };
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
 export async function listPayments(saleId: number): Promise<PaymentRow[]> {
-  const exists = await pool.query(`SELECT 1 FROM sales WHERE id = $1`, [saleId]);
-  if (exists.rowCount === 0) throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
-  const res = await pool.query<PaymentRow>(`${SELECT_PAYMENT} WHERE p.sale_id = $1 ORDER BY p.id ASC`, [saleId]);
-  return res.rows;
+  const exists = await Sale.findByPk(saleId, { attributes: ['id'] });
+  if (!exists) throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
+  const rows = await Payment.findAll({
+    where: { sale_id: saleId },
+    include: PAYMENT_INCLUDES,
+    subQuery: false,
+    order: [['id', 'ASC']],
+  });
+  return (rows as unknown as PaymentWithRefs[]).map(toPaymentRow);
 }
 
-/* ============ void / retur: stok balik per item + kondisi (FASE 5) ============ */
+/* ============ void / retur: stok balik per item + kondisi ============ */
 
 /**
- * Sejak 0005 trigger fn_sales_void_apply TIDAK lagi membuat movement IN otomatis.
- * Stok balik (void/retur/refund) sekarang ditulis di service ini sebagai SATU PENULIS,
- * per item dan BERKONDISI:
- *   GOOD -> movement IN -> trigger menambah qty_remaining (barang bisa dijual lagi)
- *   RUSAK -> movement IN -> trigger menambah qty_damaged (karantina, tidak ikut terjual)
- * Dengan begitu barang rusak punya jejak ledger tersendiri dan tidak terhitung dua kali.
- * fn_sales_void (validasi transisi status) tetap penjaga di DB. Tidak ada endpoint
- * DELETE untuk sale/item - ledger immutable.
+ * Sejak 0005 trigger `fn_sales_void_apply` TIDAK lagi membuat movement IN
+ * otomatis. Stok balik (void/retur/refund) sekarang ditulis di service ini
+ * sebagai SATU PENULIS, per item dan BERKONDISI:
+ *   GOOD -> movement IN -> trigger menambah `qty_remaining` (bisa dijual lagi)
+ *   RUSAK -> movement IN -> trigger menambah `qty_damaged` (karantina)
+ * Dengan begitu barang rusak punya jejak ledger tersendiri dan tidak terhitung
+ * dua kali. `fn_sales_void` (validasi transisi status) tetap penjaga di DB.
+ * Tidak ada endpoint DELETE untuk sale/item - ledger immutable.
  */
 
 /** sale_items + sisa qty yang belum direfund (dasar validasi refund parsial). */
@@ -543,27 +821,35 @@ interface RefundLine extends ReturnLine {
   subtotal: number;
 }
 
-async function loadReturnableItems(client: PoolClient, saleId: number): Promise<Map<number, ReturnableItem>> {
-  const res = await client.query<ReturnableItem>(
+/**
+ * Σ qty `refund_items` per sale_item (dasar validasi refund parsial). SQL-nya
+ * identik dengan versi lama; agregasi lewat `sequelize.query` karena ini
+ * agregasi lintas-tabel (hybrid §D4 — nilainya tetap di-bind, bukan string).
+ */
+async function loadReturnableItems(
+  transaction: Transaction,
+  saleId: number,
+): Promise<Map<number, ReturnableItem>> {
+  const rows = (await sequelize.query(
     `SELECT si.id, si.product_id, si.batch_id, si.qty, si.unit_price, si.unit_cost,
             COALESCE((SELECT sum(ri.qty) FROM refund_items ri WHERE ri.sale_item_id = si.id), 0)::numeric(14,3) AS refunded_qty
        FROM sale_items si
-      WHERE si.sale_id = $1
+      WHERE si.sale_id = $saleId
       ORDER BY si.id`,
-    [saleId],
-  );
-  return new Map(res.rows.map((r) => [Number(r.id), r]));
+    { bind: { saleId }, type: QueryTypes.SELECT, transaction },
+  )) as ReturnableItem[];
+  return new Map(rows.map((r) => [Number(r.id), r]));
 }
 
 /**
  * Tulis movement IN untuk barang yang kembali ke gudang. Konvensi kolom mengikuti
- * trigger lama (fn_sales_void_apply): reference_type VOID/RETURN, reference_id = sale,
- * unit_cost = snapshot unit_cost sale_items, created_by = kasir yang membatalkan.
- * `condition` adalah kolom ledger baru (migration 0005) yang menentukan kolom mana
- * di stock_batches yang berubah (qty_remaining atau qty_damaged).
+ * trigger lama (`fn_sales_void_apply`): `reference_type` VOID/RETURN,
+ * `reference_id` = sale, `unit_cost` = snapshot `unit_cost` sale_items,
+ * `created_by` = kasir yang membatalkan. `condition` menentukan kolom mana di
+ * `stock_batches` yang berubah (`qty_remaining` atau `qty_damaged`).
  */
 async function insertReturnMovements(
-  client: PoolClient,
+  transaction: Transaction,
   opts: {
     saleId: number;
     lines: ReturnLine[];
@@ -574,21 +860,20 @@ async function insertReturnMovements(
   },
 ): Promise<void> {
   for (const line of opts.lines) {
-    await client.query(
-      `INSERT INTO stock_movements
-         (product_id, batch_id, movement_type, qty_change, unit_cost, reference_type, reference_id, note, created_by, condition)
-       VALUES ($1, $2, 'IN', $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        line.product_id,
-        line.batch_id,
-        line.qty,
-        line.unit_cost,
-        opts.referenceType,
-        opts.saleId,
-        line.condition === 'RUSAK' ? opts.noteDamaged : opts.noteGood,
-        opts.userId,
-        line.condition,
-      ],
+    await StockMovement.create(
+      {
+        product_id: line.product_id,
+        batch_id: line.batch_id,
+        movement_type: 'IN',
+        qty_change: line.qty,
+        unit_cost: line.unit_cost,
+        reference_type: opts.referenceType,
+        reference_id: opts.saleId,
+        note: line.condition === 'RUSAK' ? opts.noteDamaged : opts.noteGood,
+        created_by: opts.userId,
+        condition: line.condition,
+      },
+      { transaction },
     );
   }
 }
@@ -605,7 +890,11 @@ async function insertReturnMovements(
  * saat `status` benar-benar BERUBAH, sehingga void kedua pada sale yang sudah VOIDED
  * akan lolos bila tidak dicegah di sini.
  */
-function planVoidReturn(saleId: number, items: Map<number, ReturnableItem>, requested: VoidItemInput[] | null): ReturnLine[] {
+function planVoidReturn(
+  saleId: number,
+  items: Map<number, ReturnableItem>,
+  requested: VoidItemInput[] | null,
+): ReturnLine[] {
   if (!requested || requested.length === 0) {
     return [...items.values()].map((it) => ({
       product_id: it.product_id,
@@ -666,7 +955,7 @@ function planVoidReturn(saleId: number, items: Map<number, ReturnableItem>, requ
         `total qty void untuk sale_item_id=${it.id} (${total}) harus sama dengan qty jual (${it.qty})`,
       );
     }
-    for (const condition of <StockCondition[]>['GOOD', 'RUSAK']) {
+    for (const condition of ['GOOD', 'RUSAK'] as const) {
       const qty = round3(bucket[condition]);
       if (qty > 0) {
         lines.push({ product_id: it.product_id, batch_id: it.batch_id, qty, unit_cost: it.unit_cost, condition });
@@ -683,47 +972,46 @@ export async function voidSale(
   userId: number,
   requested?: VoidItemInput[] | null,
 ): Promise<SaleDetail> {
-  return withTx(async (client) => {
-    const current = await client.query<{ status: string; payment_status: string }>(
-      `SELECT status, payment_status FROM sales WHERE id = $1 FOR UPDATE`,
-      [saleId],
-    );
-    if (!current.rows[0]) {
-      throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
-    }
+  try {
+    return await withOrmTx(async (transaction) => {
+      const current = await Sale.findByPk(saleId, { transaction, lock: transaction.LOCK.UPDATE });
+      if (!current) {
+        throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
+      }
 
-    const { status, payment_status } = current.rows[0];
-    if (status !== 'COMPLETED') {
-      throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${status}, tidak bisa di-void lagi`);
-    }
-    // VOIDED hanya untuk yang belum dibayar; yang sudah dibayar wajib lewat refund.
-    if (payment_status !== 'UNPAID') {
-      throw new ApiError('VOID_NOT_ALLOWED', 'Tidak dapat void penjualan yang sudah dibayar; gunakan retur/refund');
-    }
+      const { status, payment_status } = current;
+      if (status !== 'COMPLETED') {
+        throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${status}, tidak bisa di-void lagi`);
+      }
+      // VOIDED hanya untuk yang belum dibayar; yang sudah dibayar wajib lewat refund.
+      if (payment_status !== 'UNPAID') {
+        throw new ApiError('VOID_NOT_ALLOWED', 'Tidak dapat void penjualan yang sudah dibayar; gunakan retur/refund');
+      }
 
-    const items = await loadReturnableItems(client, saleId);
-    const lines = planVoidReturn(saleId, items, requested ?? null);
+      const items = await loadReturnableItems(transaction, saleId);
+      const lines = planVoidReturn(saleId, items, requested ?? null);
 
-    await client.query(`UPDATE sales SET status = 'VOIDED', voided_by = $2, void_reason = $3 WHERE id = $1`, [
-      saleId,
-      userId,
-      reason,
-    ]);
+      // `voided_at` diisi trigger `trg_sales_void` (COALESCE(now())) — jangan
+      // ditulis di sini supaya metadata void tetap milik DB.
+      await current.update({ status: 'VOIDED', voided_by: userId, void_reason: reason }, { transaction });
 
-    await insertReturnMovements(client, {
-      saleId,
-      lines,
-      referenceType: 'VOID',
-      noteGood: 'Void penjualan',
-      noteDamaged: 'Void penjualan - rusak',
-      userId,
-    });
+      await insertReturnMovements(transaction, {
+        saleId,
+        lines,
+        referenceType: 'VOID',
+        noteGood: 'Void penjualan',
+        noteDamaged: 'Void penjualan - rusak',
+        userId,
+      });
 
-    return fetchDetail(client, saleId);
-  }, 'void');
+      return fetchDetail(transaction, saleId);
+    }, 'void');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
-/* ====================== refund / retur (P1 + parsial) ====================== */
+/* ====================== refund / retur (parsial) ====================== */
 
 /**
  * Susun rencana refund parsial (UC-A).
@@ -825,6 +1113,11 @@ function planRefund(
  *  4. Catat 1 baris `refunds` + `refund_items` + movement IN per item bercondition.
  *  5. Status: parsial tetap COMPLETED; semua item habis -> 'RETURNED' (trigger validasi).
  * Di bungkus Idempotency-Key agar retry tidak dobel refund.
+ *
+ * Catatan uang: TIDAK ada baris `payments` negatif dan TIDAK ada write-off opex
+ * di sini — sama seperti versi lama (`git show e33b3b5:...`). Uang keluar dicatat
+ * sebagai pengurangan `refunded_amount`; sesi kas (opening/closing) yang
+ * memasukkan_refund ke perhitungan kas baru ada di MP-5.
  */
 export async function refundSale(
   saleId: number,
@@ -832,88 +1125,97 @@ export async function refundSale(
   userId: number,
   idempotencyKey: string,
 ): Promise<{ sale: SaleDetail; replayed: boolean }> {
-  const result = await runIdempotent<SaleDetail>('POST /sales/{id}/refund', idempotencyKey, async (client) => {
-    const current = await client.query<{ status: string; payment_status: string }>(
-      `SELECT status, payment_status FROM sales WHERE id = $1 FOR UPDATE`,
-      [saleId],
-    );
-    if (!current.rows[0]) throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
-    if (current.rows[0].status !== 'COMPLETED') {
-      throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${current.rows[0].status}, tidak bisa diretur lagi`);
-    }
-    if (current.rows[0].payment_status === 'UNPAID') {
-      throw new ApiError('REFUND_NOT_ALLOWED', 'Penjualan belum dibayar; gunakan void untuk membatalkan penjualan');
-    }
+  try {
+    const result = await runOrmIdempotent<SaleDetail>('POST /sales/{id}/refund', idempotencyKey, async (transaction) => {
+      const current = await Sale.findByPk(saleId, { transaction, lock: transaction.LOCK.UPDATE });
+      if (!current) throw new ApiError('NOT_FOUND', `Penjualan id=${saleId} tidak ditemukan`);
+      if (current.status !== 'COMPLETED') {
+        throw new ApiError('TRANSITION_NOT_ALLOWED', `Penjualan sudah berstatus ${current.status}, tidak bisa diretur lagi`);
+      }
+      if (current.payment_status === 'UNPAID') {
+        throw new ApiError('REFUND_NOT_ALLOWED', 'Penjualan belum dibayar; gunakan void untuk membatalkan penjualan');
+      }
 
-    const items = await loadReturnableItems(client, saleId);
-    const plan = planRefund(saleId, items, input.items);
+      const items = await loadReturnableItems(transaction, saleId);
+      const plan = planRefund(saleId, items, input.items);
 
-    const money = await client.query<{ paid: number; refunded: number; method_id: number | null }>(
-      `SELECT COALESCE(sum(amount), 0)::numeric(14,2) AS paid,
-              (SELECT COALESCE(sum(amount), 0)::numeric(14,2) FROM refunds WHERE sale_id = $1) AS refunded,
-              (SELECT method_id FROM payments WHERE sale_id = $1 ORDER BY id DESC LIMIT 1) AS method_id
-         FROM payments WHERE sale_id = $1`,
-      [saleId],
-    );
-    const paidAmount = Number(money.rows[0]?.paid ?? 0);
-    const refundedAmount = Number(money.rows[0]?.refunded ?? 0);
-    const refundable = round2(paidAmount - refundedAmount);
+      const payments = await Payment.findAll({
+        where: { sale_id: saleId },
+        order: [['id', 'ASC']],
+        transaction,
+      });
+      const refunds = await Refund.findAll({ where: { sale_id: saleId }, transaction });
+      const paidAmount = round2(payments.reduce((sum, p) => sum + Number(p.amount), 0));
+      const refundedAmount = round2(refunds.reduce((sum, r) => sum + Number(r.amount), 0));
+      const refundable = round2(paidAmount - refundedAmount);
 
-    if (plan.total > refundable) {
-      throw new ApiError(
-        'REFUND_AMOUNT_EXCEEDED',
-        `Total refund ${plan.total} melebihi sisa uang yang bisa dikembalikan ${refundable} ` +
-          `(dibayar ${paidAmount}, sudah direfund ${refundedAmount})`,
+      if (plan.total > refundable) {
+        throw new ApiError(
+          'REFUND_AMOUNT_EXCEEDED',
+          `Total refund ${plan.total} melebihi sisa uang yang bisa dikembalikan ${refundable} ` +
+            `(dibayar ${paidAmount}, sudah direfund ${refundedAmount})`,
+        );
+      }
+      if (plan.total <= 0) {
+        throw new ApiError('VALIDATION_ERROR', 'Total refund harus lebih besar dari 0');
+      }
+
+      // Metode refund: boleh override, default = metode pembayaran terakhir.
+      const lastPayment = payments.length > 0 ? payments[payments.length - 1]! : null;
+      const methodId = input.method_id ?? lastPayment?.method_id ?? null;
+      if (methodId !== null) {
+        await assertMethodUsable(transaction, methodId);
+      }
+
+      const refund = await Refund.create(
+        {
+          sale_id: saleId,
+          method_id: methodId,
+          amount: plan.total,
+          reason: input.reason,
+          refunded_by: userId,
+        },
+        { transaction },
       );
-    }
-    if (plan.total <= 0) {
-      throw new ApiError('VALIDATION_ERROR', 'Total refund harus lebih besar dari 0');
-    }
 
-    // Metode refund: boleh override, default = metode pembayaran terakhir.
-    const methodId = input.method_id ?? money.rows[0]?.method_id ?? null;
-    if (methodId !== null) {
-      await assertMethodUsable(client, methodId);
-    }
+      for (const line of plan.lines) {
+        await RefundItem.create(
+          {
+            refund_id: refund.id,
+            sale_item_id: line.sale_item_id,
+            qty: line.qty,
+            condition: line.condition,
+            unit_price: line.unit_price,
+            subtotal: line.subtotal,
+          },
+          { transaction },
+        );
+      }
 
-    const refundIns = await client.query<{ id: number }>(
-      `INSERT INTO refunds (sale_id, method_id, amount, reason, refunded_by)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [saleId, methodId, plan.total, input.reason, userId],
-    );
-    const refundId = refundIns.rows[0]!.id;
+      await insertReturnMovements(transaction, {
+        saleId,
+        lines: plan.lines,
+        referenceType: 'RETURN',
+        noteGood: 'Retur customer',
+        noteDamaged: 'Retur customer - rusak',
+        userId,
+      });
 
-    for (const line of plan.lines) {
-      await client.query(
-        `INSERT INTO refund_items (refund_id, sale_item_id, qty, condition, unit_price, subtotal)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [refundId, line.sale_item_id, line.qty, line.condition, line.unit_price, line.subtotal],
-      );
-    }
+      // Refund penuh (semua item habis) -> tutup penjualan sebagai RETURNED.
+      // Trigger fn_sales_void tetap memvalidasi transisi COMPLETED -> RETURNED.
+      if (plan.full) {
+        await current.update(
+          { status: 'RETURNED', voided_by: userId, void_reason: `REFUND: ${input.reason}` },
+          { transaction },
+        );
+      }
 
-    await insertReturnMovements(client, {
-      saleId,
-      lines: plan.lines,
-      referenceType: 'RETURN',
-      noteGood: 'Retur customer',
-      noteDamaged: 'Retur customer - rusak',
-      userId,
+      const detail = await fetchDetail(transaction, saleId);
+      return { status: 200, body: detail };
     });
 
-    // Refund penuh (semua item habis) -> tutup penjualan sebagai RETURNED.
-    // Trigger fn_sales_void tetap memvalidasi transisi COMPLETED -> RETURNED.
-    if (plan.full) {
-      await client.query(`UPDATE sales SET status = 'RETURNED', voided_by = $2, void_reason = $3 WHERE id = $1`, [
-        saleId,
-        userId,
-        `REFUND: ${input.reason}`,
-      ]);
-    }
-
-    const detail = await fetchDetail(client, saleId);
-    return { status: 200, body: detail };
-  });
-
-  return { sale: result.body, replayed: result.replayed };
+    return { sale: result.body, replayed: result.replayed };
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }

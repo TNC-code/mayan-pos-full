@@ -20,10 +20,11 @@ import { getSale } from './sale.service.js';
  *    bisa membaca lewat pool sebelum commit);
  *  - retry policy `fase.md` tetap lewat `withRetry` (hanya error koneksi/serialisasi).
  *
- * Catatan `saleReceipt`: dirakit tetap sama, tapi sumber `store` sekarang model
- * Sequelize sedangkan `sale` masih dibaca lewat `getSale()` yang versi raw SQL
- *-nya baru pindah di MP-4. Mengangkat `getSale()` di MP-2 berarti ikut menarik
- * modul sales ke scope MP-2, jadi keduanya sengaja dibiarkan terpisah sampai MP-4.
+* Catatan `saleReceipt` (MP-4): `getSale()` kini sudah di atas Sequelize
+ * (models Sale/SaleItem/Payment/Refund), jadi nota.ini sepenuhnya ORM — hybrid
+ * raw-SQL yang tersisa di service ini sudah tidak ada. Bentuk response
+ * `Receipt` tidak berubah: field nota disusun di sini dari `SaleDetail`
+ * (nama toko, nama customer/kasir sudah ikut di-select `getSale`).
  */
 
 export interface StoreProfileRow {
