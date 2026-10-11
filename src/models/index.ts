@@ -7,6 +7,8 @@ import { initProductCategory, ProductCategory } from './product-category.model.j
 import { initProductType, ProductType } from './product-type.model.js';
 import { initCustomer, Customer } from './customer.model.js';
 import { initPaymentMethod, PaymentMethod } from './payment-method.model.js';
+import { initStockBatch, StockBatch } from './stock-batch.model.js';
+import { initStockMovement, StockMovement } from './stock-movement.model.js';
 import { initStoreProfile, StoreProfile } from './store-profile.model.js';
 import { initIdempotencyKey, IdempotencyKey } from './idempotency-key.model.js';
 
@@ -46,6 +48,8 @@ export function initModels(instance: Sequelize = sequelize): void {
   initProductType(instance);
   initCustomer(instance);
   initPaymentMethod(instance);
+  initStockBatch(instance);
+  initStockMovement(instance);
   initStoreProfile(instance);
   initIdempotencyKey(instance);
   initialized = true;
@@ -69,6 +73,30 @@ export function associate(): void {
   // Customer <-> Sales ditunda ke MP-4.1 (butuh `sale.model.ts`); sementara ini
   // `sales.customer_id` dibaca lewat kolom FK langsung, sama seperti versi raw SQL.
 
+  /* ------------------------- stok & pembelian (MP-3) -------------------------
+   * Alias dipilih agar tidak menabrak nama kolom FK yang sama persis
+   * (`created_by` sudah jadi `dataValues` kolom, jadi association memakai
+   * alias `creator`, bukan `created_by`).
+   *
+   * PENTING saat `include` model `Product` dari service mana pun: model ini
+   * punya default scope `is_active = true` (soft delete). Query lama
+   * (`JOIN product p ON p.id = …`) TIDAK memfilter itu — batch/ledger produk
+   * nonaktif tetap harus terbaca. Karena itu semua include wajib lewat
+   * `Product.scope('withInactive')`.
+   */
+  Product.hasMany(StockBatch, { foreignKey: 'product_id', as: 'batches' });
+  StockBatch.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
+
+  StockBatch.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+
+  Product.hasMany(StockMovement, { foreignKey: 'product_id', as: 'movements' });
+  StockMovement.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
+
+  StockBatch.hasMany(StockMovement, { foreignKey: 'batch_id', as: 'movements' });
+  StockMovement.belongsTo(StockBatch, { foreignKey: 'batch_id', as: 'batch' });
+
+  StockMovement.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+
   associated = true;
 }
 
@@ -85,6 +113,8 @@ export {
   ProductCategory,
   ProductType,
   RefreshToken,
+  StockBatch,
+  StockMovement,
   StoreProfile,
   UserAccount,
 };
@@ -99,3 +129,10 @@ export type { IdempotencyKeyAttributes } from './idempotency-key.model.js';
 export type { RefreshTokenAttributes } from './refresh-token.model.js';
 export type { StoreProfileAttributes } from './store-profile.model.js';
 export type { UserAccountAttributes } from './user-account.model.js';
+export type { StockBatchAttributes, StockBatchCreationAttributes } from './stock-batch.model.js';
+export type {
+  StockMovementAttributes,
+  StockMovementCreationAttributes,
+  MovementType,
+  MovementCondition,
+} from './stock-movement.model.js';

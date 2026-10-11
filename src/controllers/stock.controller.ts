@@ -9,7 +9,7 @@ import type { MovementRow, ProductStockRow } from '../services/stock.service.js'
 /* ----------------------------- purchases ----------------------------- */
 export async function listPurchases(_req: Request, res: Response): Promise<void> {
   const q = validated<{ product_id?: number; q?: string; active_only?: boolean; limit: number; offset: number }>(res);
-  res.status(200).json(await purchaseService.listBatches(q));
+  res.status(200).json(await purchaseService.listPurchases(q));
 }
 
 export async function createPurchase(req: Request, res: Response): Promise<void> {
@@ -50,7 +50,7 @@ export async function listStock(_req: Request, res: Response): Promise<void> {
     limit: number;
     offset: number;
   }>(res);
-  res.status(200).json(await stockService.getStock(q));
+  res.status(200).json(await stockService.listStock(q));
 }
 
 export async function getProductStock(req: Request, res: Response): Promise<void> {
@@ -64,6 +64,7 @@ export async function listMovements(_req: Request, res: Response): Promise<void>
     type?: string;
     reference_type?: string;
     reference_id?: number;
+    condition?: string;
     limit: number;
     offset: number;
   }>(res);

@@ -1,6 +1,26 @@
-import { pool } from '../config/db.js';
-import { env } from '../config/env.js';
+import { Op, QueryTypes, type Includeable } from 'sequelize';
 import { ApiError } from '../utils/errors.js';
+import { isoDateOnly } from '../utils/dates.js';
+import { env } from '../config/env.js';
+import { Product, StockBatch, StockMovement, UserAccount, sequelize } from '../models/index.js';
+
+/**
+ * Stok per produk & ledger pergerakan (MP-3).
+ *
+ * Dua jalur baca yang disengaja (hybrid §D4):
+ *  - `listStock` = agregat per produk (SUM qty_remaining/qty_damaged + MIN expired
+ *    per produk + filter agregat `expiring_in_days`/`in_stock_only`/`damaged_only`).
+ *    SQL-nya disalin PERSIS dari versi raw SQL lama karena (a) sudah teruji,
+ *    (b) `HAVING` atas agregat jauh lebih ringkas daripada builder ORM.
+ *    Yang berubah hanya transport: `pool.query` -> `sequelize.query` dengan
+ *    `bind` parameter (tanpa interpolation string).
+ *  - `listMovements` = ledger append-only, dibaca lewat model `StockMovement`
+ *    + include produk/batch/user (satu join, tanpa agregat).
+ *
+ * Aplikasi tidak pernah menghitung/mutasi stok: semua angka murni hasil trigger
+ * `trg_stock_movement_apply` (D3). `qty_on_hand` hanya GOOD karena itu yang boleh
+ * terjual POS; `qty_damaged` = barang rusak karantina; `physical_total` = keduanya.
+ */
 
 export interface ProductStockRow {
   product_id: number;
@@ -16,21 +36,7 @@ export interface ProductStockRow {
   nearest_expiry: string | null;
 }
 
-/**
- * Query stok TANPA view (fase.md section 0, wajib dipakai persis pola ini):
- *
- *   SELECT p.id, p.sku, p.barcode, p.name, p.unit,
- *          COALESCE(SUM(b.qty_remaining), 0)::numeric(14,3) AS qty_on_hand,
- *          MIN(b.expired_date) AS nearest_expiry
- *   FROM product p LEFT JOIN stock_batches b ON b.product_id = p.id
- *   GROUP BY p.id, p.sku, p.barcode, p.name, p.unit;
- *
- * Aplikasi tidak pernah menghitung/mutasi stok: angka ini murni hasil trigger DB.
- * Kolom tambahan (filter) hanya WHERE/HAVING, tidak mengubah perhitungan.
- * v2: `qty_damaged` (barang rusak karantina) ikut ditampilkan sebagai kolom tambahan;
- * `qty_on_hand` tetap HANYA barang GOOD karena itu yang boleh terjual POS.
- */
-export async function getStock(params: {
+export interface StockListQuery {
   product_id?: number;
   q?: string;
   category_id?: number;
@@ -40,45 +46,49 @@ export async function getStock(params: {
   damaged_only?: boolean;
   limit: number;
   offset: number;
-}): Promise<ProductStockRow[]> {
-  const args: unknown[] = [];
+}
+
+/**
+ * Query stok TANPA view (fase.md section 0, wajib dipakai persis pola ini):
+ *
+ *   SELECT p.id, p.sku, p.barcode, p.name, p.unit,
+ *          COALESCE(SUM(b.qty_remaining), 0)::numeric(14,3) AS qty_on_hand,
+ *          MIN(b.expired_date) AS nearest_expiry
+ *   FROM product p LEFT JOIN stock_batches b ON b.product_id = p.id
+ *   GROUP BY p.id, p.sku, p.barcode, p.name, p.unit;
+ *
+ * Kolom tambahan (filter) hanya WHERE/HAVING, tidak mengubah perhitungan.
+ */
+export async function listStock(params: StockListQuery): Promise<ProductStockRow[]> {
+  const binds: unknown[] = [];
   const where: string[] = [];
   const having: string[] = [];
+  const push = (value: unknown): string => {
+    binds.push(value);
+    return `$${binds.length}`;
+  };
 
-  if (params.product_id !== undefined) {
-    args.push(params.product_id);
-    where.push(`p.id = $${args.length}`);
-  }
-  if (params.category_id !== undefined) {
-    args.push(params.category_id);
-    where.push(`p.category_id = $${args.length}`);
-  }
+  if (params.product_id !== undefined) where.push(`p.id = ${push(params.product_id)}`);
+  if (params.category_id !== undefined) where.push(`p.category_id = ${push(params.category_id)}`);
   if (params.q) {
-    args.push(`%${params.q}%`);
-    where.push(`(p.name ILIKE $${args.length} OR p.sku ILIKE $${args.length} OR p.barcode ILIKE $${args.length})`);
+    const like = push(`%${params.q}%`);
+    where.push(`(p.name ILIKE ${like} OR p.sku ILIKE ${like} OR p.barcode ILIKE ${like})`);
   }
-  if (params.active_only) {
-    where.push('p.is_active = true');
-  }
+  if (params.active_only) where.push('p.is_active = true');
 
   // Filter near-expiry harus di HAVING karena berbasis agregat MIN(expired_date).
   if (params.expiring_in_days !== undefined) {
-    args.push(env.businessTz, params.expiring_in_days);
-    const tzIdx = args.length - 1;
-    const daysIdx = args.length;
-    having.push(
-      `MIN(b.expired_date) IS NOT NULL AND MIN(b.expired_date) <= (now() AT TIME ZONE $${tzIdx})::date + $${daysIdx}::int`,
-    );
+    const tz = push(env.businessTz);
+    const days = push(params.expiring_in_days);
+    having.push(`MIN(b.expired_date) IS NOT NULL AND MIN(b.expired_date) <= (now() AT TIME ZONE ${tz})::date + ${days}::int`);
   }
-  if (params.in_stock_only) {
-    having.push('COALESCE(SUM(b.qty_remaining), 0) > 0');
-  }
+  if (params.in_stock_only) having.push('COALESCE(SUM(b.qty_remaining), 0) > 0');
   // Hanya produk yang punya barang rusak karantina (untuk layar "siap diretur").
-  if (params.damaged_only) {
-    having.push('COALESCE(SUM(b.qty_damaged), 0) > 0');
-  }
+  if (params.damaged_only) having.push('COALESCE(SUM(b.qty_damaged), 0) > 0');
 
-  args.push(params.limit, params.offset);
+  const limitIdx = binds.push(params.limit);
+  const offsetIdx = binds.push(params.offset);
+
   const sql = `
     SELECT p.id AS product_id, p.sku, p.barcode, p.name, p.unit,
            COALESCE(SUM(b.qty_remaining), 0)::numeric(14,3) AS qty_on_hand,
@@ -91,18 +101,21 @@ export async function getStock(params: {
      GROUP BY p.id, p.sku, p.barcode, p.name, p.unit
      ${having.length > 0 ? `HAVING ${having.join(' AND ')}` : ''}
      ORDER BY p.name ASC
-     LIMIT $${args.length - 1} OFFSET $${args.length}`;
+     LIMIT $${limitIdx} OFFSET $${offsetIdx}`;
 
-  const res = await pool.query<ProductStockRow>(sql, args as never[]);
-  return res.rows;
+  const rows = (await sequelize.query(sql, { bind: binds, type: QueryTypes.SELECT })) as Array<
+    Omit<ProductStockRow, 'nearest_expiry'> & { nearest_expiry: string | null }
+  >;
+  return rows.map((row) => ({ ...row, nearest_expiry: isoDateOnly(row.nearest_expiry) }));
 }
 
+/** `GET /stock/products/:id` — satu baris; produk tidak ada -> 404. */
 export async function getProductStock(productId: number): Promise<ProductStockRow> {
-  const rows = await getStock({ product_id: productId, limit: 1, offset: 0 });
+  const rows = await listStock({ product_id: productId, limit: 1, offset: 0 });
   const row = rows[0];
   if (!row) {
-    const exists = await pool.query(`SELECT 1 FROM product WHERE id = $1`, [productId]);
-    if (!exists.rows[0]) throw new ApiError('NOT_FOUND', `Produk id=${productId} tidak ditemukan`);
+    const exists = await Product.scope('withInactive').findByPk(productId, { attributes: ['id'] });
+    if (!exists) throw new ApiError('NOT_FOUND', `Produk id=${productId} tidak ditemukan`);
   }
   return row!;
 }
@@ -136,20 +149,20 @@ export async function getDamagedStock(params: {
   limit: number;
   offset: number;
 }): Promise<DamagedStockRow[]> {
-  const args: unknown[] = [];
+  const binds: unknown[] = [];
   const where: string[] = ['b.qty_damaged > 0'];
 
   if (params.product_id !== undefined) {
-    args.push(params.product_id);
-    where.push(`b.product_id = $${args.length}`);
+    binds.push(params.product_id);
+    where.push(`b.product_id = $${binds.length}`);
   }
   if (params.q) {
-    args.push(`%${params.q}%`);
-    where.push(`(p.name ILIKE $${args.length} OR p.sku ILIKE $${args.length} OR b.batch_code ILIKE $${args.length})`);
+    binds.push(`%${params.q}%`);
+    where.push(`(p.name ILIKE $${binds.length} OR p.sku ILIKE $${binds.length} OR b.batch_code ILIKE $${binds.length})`);
   }
 
-  args.push(params.limit, params.offset);
-  const res = await pool.query<DamagedStockRow>(
+  binds.push(params.limit, params.offset);
+  const rows = (await sequelize.query(
     `SELECT b.id AS batch_id, b.batch_code, p.id AS product_id, p.name AS product_name, p.sku, p.unit,
             b.qty_damaged, b.unit_cost,
             (b.qty_damaged * b.unit_cost)::numeric(14,2) AS value,
@@ -158,11 +171,18 @@ export async function getDamagedStock(params: {
        JOIN product p ON p.id = b.product_id
       WHERE ${where.join(' AND ')}
       ORDER BY b.expired_date ASC NULLS LAST, b.id ASC
-      LIMIT $${args.length - 1} OFFSET $${args.length}`,
-    args as never[],
-  );
-  return res.rows;
+      LIMIT $${binds.length - 1} OFFSET $${binds.length}`,
+    { bind: binds, type: QueryTypes.SELECT },
+  )) as Array<Omit<DamagedStockRow, 'expired_date' | 'received_at'> & { expired_date: string | null; received_at: Date }>;
+
+  return rows.map((row) => ({
+    ...row,
+    expired_date: isoDateOnly(row.expired_date),
+    received_at: new Date(row.received_at).toISOString(),
+  }));
 }
+
+/* ============================ ledger pergerakan stok ============================ */
 
 export interface MovementRow {
   id: number;
@@ -183,8 +203,7 @@ export interface MovementRow {
   condition: 'GOOD' | 'RUSAK';
 }
 
-/** Ledger pergerakan stok (append-only, tidak pernah UPDATE/DELETE). */
-export async function listMovements(params: {
+export interface MovementListQuery {
   product_id?: number;
   batch_id?: number;
   type?: string;
@@ -193,49 +212,57 @@ export async function listMovements(params: {
   condition?: string;
   limit: number;
   offset: number;
-}): Promise<MovementRow[]> {
-  const args: unknown[] = [];
-  const where: string[] = [];
+}
 
-  if (params.product_id !== undefined) {
-    args.push(params.product_id);
-    where.push(`m.product_id = $${args.length}`);
-  }
-  if (params.batch_id !== undefined) {
-    args.push(params.batch_id);
-    where.push(`m.batch_id = $${args.length}`);
-  }
-  if (params.type) {
-    args.push(params.type);
-    where.push(`m.movement_type = $${args.length}`);
-  }
-  if (params.reference_type) {
-    args.push(params.reference_type);
-    where.push(`m.reference_type = $${args.length}`);
-  }
-  if (params.reference_id !== undefined) {
-    args.push(params.reference_id);
-    where.push(`m.reference_id = $${args.length}`);
-  }
-  // Filter kondisi: pisahkan jejak barang sellable vs barang rusak karantina.
-  if (params.condition) {
-    args.push(params.condition);
-    where.push(`m.condition = $${args.length}`);
-  }
+/**
+ * Ledger pergerakan stok (append-only, tidak pernah UPDATE/DELETE).
+ * Filter `condition` memisahkan jejak barang sellable vs barang rusak karantina.
+ */
+export async function listMovements(params: MovementListQuery): Promise<MovementRow[]> {
+  const conditions: Record<string, unknown>[] = [];
+  if (params.product_id !== undefined) conditions.push({ product_id: params.product_id });
+  if (params.batch_id !== undefined) conditions.push({ batch_id: params.batch_id });
+  if (params.type) conditions.push({ movement_type: params.type });
+  if (params.reference_type) conditions.push({ reference_type: params.reference_type });
+  if (params.reference_id !== undefined) conditions.push({ reference_id: params.reference_id });
+  if (params.condition) conditions.push({ condition: params.condition });
 
-  args.push(params.limit, params.offset);
-  const res = await pool.query<MovementRow>(
-    `SELECT m.id, m.product_id, p.name AS product_name, m.batch_id, b.batch_code,
-            m.movement_type, m.qty_change, m.unit_cost, m.reference_type, m.reference_id,
-            m.note, m.created_by, u.username AS created_by_name, m.created_at, m.condition
-       FROM stock_movements m
-       JOIN product p ON p.id = m.product_id
-       LEFT JOIN stock_batches b ON b.id = m.batch_id
-       LEFT JOIN user_account u ON u.id = m.created_by
-      ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
-      ORDER BY m.id DESC
-      LIMIT $${args.length - 1} OFFSET $${args.length}`,
-    args as never[],
-  );
-  return res.rows;
+  const includes: Includeable[] = [
+    { model: Product.scope('withInactive'), as: 'product', attributes: ['id', 'name'], required: true },
+    { model: StockBatch, as: 'batch', attributes: ['id', 'batch_code'], required: false },
+    { model: UserAccount, as: 'creator', attributes: ['id', 'username'], required: false },
+  ];
+
+  const rows = await StockMovement.findAll({
+    where: { [Op.and]: conditions },
+    include: includes,
+    subQuery: false,
+    order: [['id', 'DESC']],
+    limit: params.limit,
+    offset: params.offset,
+  });
+
+  return (rows as unknown as Array<
+    StockMovement & {
+      product?: { id: number; name: string | null } | null;
+      batch?: { id: number; batch_code: string } | null;
+      creator?: { id: number; username: string } | null;
+    }
+  >).map((row) => ({
+    id: row.id,
+    product_id: row.product_id,
+    product_name: row.product?.name ?? null,
+    batch_id: row.batch_id,
+    batch_code: row.batch?.batch_code ?? null,
+    movement_type: row.movement_type,
+    qty_change: row.qty_change,
+    unit_cost: row.unit_cost,
+    reference_type: row.reference_type,
+    reference_id: row.reference_id,
+    note: row.note,
+    created_by: row.created_by,
+    created_by_name: row.creator?.username ?? null,
+    created_at: new Date(row.created_at).toISOString(),
+    condition: row.condition,
+  }));
 }

@@ -1,7 +1,9 @@
 import type { PoolClient } from 'pg';
+import type { Transaction } from 'sequelize';
 import { ApiError } from './errors.js';
 import { isRetryableDbError } from './db-errors.js';
 import { withTransaction } from '../config/db.js';
+import { sequelize } from '../db/sequelize.js';
 
 const MAX_ATTEMPTS = 3;
 
@@ -30,6 +32,19 @@ export async function withRetry<T>(fn: () => Promise<T>, label: string): Promise
 /** Transaksi + retry policy. */
 export function withTx<T>(fn: (client: PoolClient) => Promise<T>, label = 'tx'): Promise<T> {
   return withRetry(() => withTransaction(fn), label);
+}
+
+/**
+ * Transaksi Sequelize + retry policy yang sama persis dengan `withTx` (MP-3).
+ *
+ * `READ COMMITTED` (default PostgreSQL) + `lock: t.LOCK.UPDATE` saat transaksi
+ * memang butuh baris terkunci — kebenaran tetap datang dari row lock, bukan
+ * dari menaikkan isolation level (plan §D5). Retry hanya untuk error
+ * serialisasi/deadlock/koneksi (`isRetryableDbError`), jadi percobaan ulang
+ * selalu punya transaksi baru (tidak ada "continued after rollback").
+ */
+export function withOrmTx<T>(fn: (transaction: Transaction) => Promise<T>, label = 'tx'): Promise<T> {
+  return withRetry(() => sequelize.transaction(fn), label);
 }
 
 /** Pembulatan uang ke 2 desimal (half-up) agar konsisten dengan numeric(14,2). */

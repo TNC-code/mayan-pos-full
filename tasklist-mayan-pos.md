@@ -96,7 +96,7 @@
 - [ ] `listPurchases`, `getBatch`, `listProductBatches` (picker FIFO kasir: hanya `qty_remaining>0`, order `received_at ASC`)
 
 ### MP-3.3 Stok & ledger
-- [ ] `stock.service.ts`: `listStock` (agregat per produk via raw SQL `sequelize.query` — hybrid plan §D4), `getProductStock`, `listMovements` (filter product/date/type/reference), `listDamagedStock` (qty_damaged > 0 per batch)
+- [x] `stock.service.ts`: `listStock` (agregat per produk via raw SQL `sequelize.query` — hybrid plan §D4), `getProductStock`, `listMovements` (filter product/date/type/reference), `getDamagedStock` (nama mengikuti kode existing; qty_damaged > 0 per batch)
 - [ ] Guard app-layer sebelum INSERT movement: stok cukup → `DAMAGED_QTY_INSUFFICIENT`/`INSUFFICIENT_STOCK` 409 (trigger tetap jaring kedua)
 
 ### MP-3.4 Verifikasi & acceptance MP-3
