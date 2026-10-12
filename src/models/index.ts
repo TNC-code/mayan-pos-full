@@ -22,6 +22,8 @@ import { initStockOpnameItem, StockOpnameItem } from './stock-opname-item.model.
 import { initSupplierReturn, SupplierReturn } from './supplier-return.model.js';
 import { initSupplierReturnItem, SupplierReturnItem } from './supplier-return-item.model.js';
 import { initOperationalExpense, OperationalExpense } from './operational-expense.model.js';
+import { initOrderBook, OrderBook } from './order-book.model.js';
+import { initOrderBookItem, OrderBookItem } from './order-book-item.model.js';
 
 /**
  * REGISTRY MODEL (plan §D4).
@@ -75,6 +77,8 @@ export function initModels(instance: Sequelize = sequelize): void {
   initSupplierReturn(instance);
   initSupplierReturnItem(instance);
   initOperationalExpense(instance);
+  initOrderBook(instance);
+  initOrderBookItem(instance);
   initialized = true;
 }
 
@@ -194,6 +198,25 @@ export function associate(): void {
 
   OperationalExpense.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
 
+  /* ---------------- order book WhatsApp & katalog internal (MP-7) ----------------
+   * Alias association memakai nama BEDA dari kolom FK-nya, supaya tidak menabrak
+   * `dataValues` (pola `creator`/`settledBy` dari MP-4..MP-6):
+   *   `created_by` -> `creator`, `processed_by` -> `processor`.
+   *
+   * `order_book_items.product_id` NULLABLE (item UNMATCHED) -> include `product`
+   * selalu `required: false`; `order_books.sale_id` NULLABLE sampai order DONE
+   * -> include `sale` juga `required: false`.
+   */
+  OrderBook.hasMany(OrderBookItem, { foreignKey: 'order_book_id', as: 'items' });
+  OrderBookItem.belongsTo(OrderBook, { foreignKey: 'order_book_id', as: 'order' });
+
+  OrderBookItem.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
+
+  OrderBook.belongsTo(Customer, { foreignKey: 'customer_id', as: 'customer' });
+  OrderBook.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+  OrderBook.belongsTo(UserAccount, { foreignKey: 'processed_by', as: 'processor' });
+  OrderBook.belongsTo(Sale, { foreignKey: 'sale_id', as: 'sale' });
+
   associated = true;
 }
 
@@ -207,6 +230,8 @@ export {
   Customer,
   IdempotencyKey,
   OperationalExpense,
+  OrderBook,
+  OrderBookItem,
   Payment,
   PaymentMethod,
   Product,
@@ -273,3 +298,10 @@ export type {
   OperationalExpenseCreationAttributes,
   ExpenseSource,
 } from './operational-expense.model.js';
+export type {
+  OrderBookAttributes,
+  OrderBookCreationAttributes,
+  OrderStatus,
+  OrderBookItemRef,
+} from './order-book.model.js';
+export type { OrderBookItemAttributes, OrderBookItemCreationAttributes } from './order-book-item.model.js';

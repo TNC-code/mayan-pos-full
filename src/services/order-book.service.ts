@@ -1,13 +1,55 @@
-import type { PoolClient } from 'pg';
-import { pool } from '../config/db.js';
+import { Op, QueryTypes, Sequelize, type Includeable, type Transaction } from 'sequelize';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/errors.js';
-import { round3, withTx } from '../utils/tx.js';
+import { round2, round3, withOrmTx } from '../utils/tx.js';
+import { mapOrmError } from '../utils/orm-errors.js';
+import {
+  Customer,
+  OrderBook,
+  OrderBookItem,
+  Product,
+  Sale,
+  UserAccount,
+  sequelize,
+  type OrderStatus,
+} from '../models/index.js';
 import { nextDocNo } from './docno.js';
 
-/* ============================== types ============================== */
+/**
+ * Order book WhatsApp di atas Sequelize (MP-7, WA-1/WA-2).
+ *
+ * Paritas penuh dengan versi raw SQL lama
+ * (`git show e33b3b5:src/services/order-book.service.ts`) — bentuk response
+ * (`OrderBookRow`/`OrderBookItemRow`/`OrderBookDetail`), urutan list (`id DESC`),
+ * kode error, dan semua guard:
+ *
+ *   create : kunci customer (advisory lock per nomor WA) -> insert header
+ *            (status PENDING, `ORD-` dari sequence) -> insert item
+ *            (product_id ada -> `unit_price` di-snapshot & `matched = true`;
+ *             tanpa product_id -> UNMATCHED, `unit_price = 0`).
+ *            Stok & ledger TIDAK disentuh sama sekali (order book bukan penjualan).
+ *   patch  : kunci order (FOR UPDATE) -> guard status PENDING/PROCESSING ->
+ *            kunci item -> pilih produk (harga di-snapshot ULANG, `matched = true`)
+ *            dan/atau ubah qty.
+ *   delete : guard status + `ORDER_LAST_ITEM` (order minimal 1 item).
+ *   status : PENDING -> PROCESSING, PENDING/PROCESSING -> CANCELLED (alasan
+ *            ditempel ke `note` dengan pemisah ' | '), CANCELLED final.
+ *   convert: DONE hanya lewat `/convert` yang mengaitkan `sale_id` penjualan
+ *            `COMPLETED`; CANCELLED ditolak, konversi ulang ke sale yang sama
+ *            = replay idempotent (200 + `X-Idempotent-Replay`).
+ *
+ * TIGA hal yang TIDAK digeser (catatan di bawah):
+ *  1. Convert TIDAK membuat penjualan. Kasir menagih lewat `POST /sales` (MP-4)
+ *     lebih dulu, lalu mengaitkan hasilnya lewat `sale_id` — kontrak openapi
+ *     (`OrderBookConvertInput: required [sale_id]`) & zod sudah mengunci itu.
+ *  2. Convert tidak menuntut status PROCESSING; order PENDING pun boleh ditutup
+ *     (parity + openapi hanya menolak CANCELLED).
+ *  3. Alasan pembatalan tetap di `note` (tidak ada kolom `cancelled_reason`).
+ */
 
-export type OrderStatus = 'PENDING' | 'PROCESSING' | 'DONE' | 'CANCELLED';
+export type { OrderStatus };
+
+/* ============================== types ============================== */
 
 export interface OrderBookRow {
   id: number;
@@ -76,82 +118,217 @@ export interface OrderBookInput {
   items: OrderBookInputItem[];
 }
 
-/* ============================ selectors ============================ */
+/* ============================ includes ============================ */
 
-const SELECT_ORDER_BOOK = `
-  SELECT ob.id, ob.order_no, ob.status, ob.source, ob.customer_id, ob.customer_name, ob.customer_phone,
-         ob.raw_message, ob.note, ob.sale_id, s.sale_no,
-         ob.created_by, cu.username AS created_by_name,
-         ob.processed_by, pu.username AS processed_by_name,
-         ob.created_at, ob.updated_at,
-         (SELECT count(*)::int FROM order_book_items i WHERE i.order_book_id = ob.id) AS item_count,
-         (SELECT count(*)::int FROM order_book_items i WHERE i.order_book_id = ob.id AND i.matched = false) AS unmatched_count,
-         (SELECT COALESCE(sum(i.qty), 0)::numeric(14,3) FROM order_book_items i WHERE i.order_book_id = ob.id) AS total_qty,
-         (SELECT COALESCE(sum(i.qty * i.unit_price), 0)::numeric(14,2) FROM order_book_items i WHERE i.order_book_id = ob.id) AS estimated_total
-    FROM order_books ob
-    LEFT JOIN sales s ON s.id = ob.sale_id
-    LEFT JOIN user_account cu ON cu.id = ob.created_by
-    LEFT JOIN user_account pu ON pu.id = ob.processed_by
-`;
+const WITH_CREATOR: Includeable = {
+  model: UserAccount,
+  as: 'creator',
+  attributes: ['id', 'username'],
+  required: false,
+};
 
-const SELECT_ITEM = `
-  SELECT i.id, i.order_book_id, i.product_id, i.product_name, i.raw_text, i.qty, i.unit_price,
-         i.matched, i.match_score, (i.qty * i.unit_price)::numeric(14,2) AS subtotal
-    FROM order_book_items i
-`;
+const WITH_PROCESSOR: Includeable = {
+  model: UserAccount,
+  as: 'processor',
+  attributes: ['id', 'username'],
+  required: false,
+};
+
+// `Sale` tidak punya default scope, jadi cukup include biasa: yang perlu hanya sale_no.
+const WITH_SALE: Includeable = {
+  model: Sale,
+  as: 'sale',
+  attributes: ['id', 'sale_no'],
+  required: false,
+};
+
+const ORDER_INCLUDES: Includeable[] = [WITH_CREATOR, WITH_PROCESSOR, WITH_SALE];
+
+type OrderBookWithRefs = OrderBook & {
+  creator?: { id: number; username: string | null } | null;
+  processor?: { id: number; username: string | null } | null;
+  sale?: { id: number; sale_no: string | null } | null;
+};
+
+/** Alias tabel yang dipakai Sequelize di SQL hasil `findAll` (nama model class). */
+const ORDER_ALIAS = 'OrderBook';
+
+function toOrderRow(row: OrderBookWithRefs, agg: OrderAgg): OrderBookRow {
+  return {
+    id: row.id,
+    order_no: row.order_no,
+    status: row.status,
+    source: row.source,
+    customer_id: row.customer_id,
+    // Snapshot dari chat (bukan JOIN ke customer) — sama seperti SELECT versi lama.
+    customer_name: row.customer_name,
+    customer_phone: row.customer_phone,
+    raw_message: row.raw_message,
+    note: row.note,
+    sale_id: row.sale_id,
+    sale_no: row.sale?.sale_no ?? null,
+    created_by: row.created_by,
+    created_by_name: row.creator?.username ?? null,
+    processed_by: row.processed_by,
+    processed_by_name: row.processor?.username ?? null,
+    created_at: new Date(row.created_at).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(),
+    item_count: agg.count,
+    unmatched_count: agg.unmatched,
+    total_qty: round3(agg.qty),
+    estimated_total: round2(agg.estimated),
+  };
+}
+
+interface OrderAgg {
+  count: number;
+  unmatched: number;
+  qty: number;
+  estimated: number;
+}
+
+const EMPTY_AGG: OrderAgg = { count: 0, unmatched: 0, qty: 0, estimated: 0 };
+
+/**
+ * Agregat item per order (`item_count`, `unmatched_count`, `total_qty`,
+ * `estimated_total`). Versi lama memakai 4 subquery korelasi per baris; di sini
+ * satu query untuk semua id yang sudah terpaginasi lalu dijumlahkan di memori —
+ * angka & pembulatan identik, hanya bentuk SQL-nya yang berbeda.
+ */
+async function aggregateItems(orderIds: number[]): Promise<Map<number, OrderAgg>> {
+  const totals = new Map<number, OrderAgg>();
+  if (orderIds.length === 0) return totals;
+
+  const items = await OrderBookItem.findAll({
+    where: { order_book_id: { [Op.in]: orderIds } },
+    attributes: ['order_book_id', 'qty', 'unit_price', 'matched'],
+    raw: true,
+  });
+
+  for (const item of items as unknown as Array<{
+    order_book_id: number;
+    qty: number;
+    unit_price: number;
+    matched: boolean;
+  }>) {
+    const acc = totals.get(item.order_book_id) ?? { ...EMPTY_AGG };
+    acc.count += 1;
+    if (!item.matched) acc.unmatched += 1;
+    acc.qty += item.qty;
+    acc.estimated += item.qty * item.unit_price;
+    totals.set(item.order_book_id, acc);
+  }
+  return totals;
+}
+
+function toItemRow(row: OrderBookItem): OrderBookItemRow {
+  return {
+    id: row.id,
+    order_book_id: row.order_book_id,
+    product_id: row.product_id,
+    product_name: row.product_name,
+    raw_text: row.raw_text,
+    qty: row.qty,
+    unit_price: row.unit_price,
+    matched: row.matched,
+    match_score: row.match_score,
+    // Tidak ada kolom `subtotal` di DB: dihitung di sini seperti SELECT lama
+    // (`(i.qty * i.unit_price)::numeric(14,2)`).
+    subtotal: round2(row.qty * row.unit_price),
+  };
+}
 
 /* ============================== list ============================== */
 
-export async function listOrderBooks(params: {
+export interface OrderBookListQuery {
   status?: string;
   date_from?: string;
   date_to?: string;
   q?: string;
   limit: number;
   offset: number;
-}): Promise<OrderBookRow[]> {
-  const args: unknown[] = [];
-  const where: string[] = [];
-  const tz = env.businessTz;
+}
 
-  if (params.status) {
-    args.push(params.status);
-    where.push(`ob.status = $${args.length}`);
-  }
-  if (params.date_from) {
-    args.push(tz);
-    const tzIdx = args.length;
-    args.push(params.date_from);
-    where.push(`(ob.created_at AT TIME ZONE $${tzIdx})::date >= $${args.length}::date`);
-  }
-  if (params.date_to) {
-    args.push(tz);
-    const tzIdx = args.length;
-    args.push(params.date_to);
-    where.push(`(ob.created_at AT TIME ZONE $${tzIdx})::date <= $${args.length}::date`);
-  }
+/**
+ * `GET /order-books` — daftar order (default `id DESC`).
+ * `q` mencocokkan `order_no`/nama/nomor WA dengan ILIKE, sama seperti versi lama.
+ */
+export async function listOrderBooks(params: OrderBookListQuery): Promise<OrderBookRow[]> {
+  const conditions: Record<string, unknown>[] = [];
+
+  if (params.status) conditions.push({ status: params.status });
   if (params.q) {
-    args.push(`%${params.q}%`);
-    where.push(`(ob.order_no ILIKE $${args.length} OR ob.customer_name ILIKE $${args.length} OR ob.customer_phone ILIKE $${args.length})`);
+    const like = `%${params.q}%`;
+    conditions.push({
+      [Op.or]: [
+        { order_no: { [Op.iLike]: like } },
+        { customer_name: { [Op.iLike]: like } },
+        { customer_phone: { [Op.iLike]: like } },
+      ],
+    });
   }
 
-  args.push(params.limit, params.offset);
-  const res = await pool.query<OrderBookRow>(
-    `${SELECT_ORDER_BOOK} ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
-     ORDER BY ob.id DESC LIMIT $${args.length - 1} OFFSET $${args.length}`,
-    args as never[],
-  );
-  return res.rows;
+  // Tanggal order = tanggal dibuatnya order, dalam zona waktu bisnis —
+  // literal + `sequelize.escape` (nilai user di-bind, tidak di-interpolasi).
+  // Kolom harus dirujuk lewat ALIAS tabel yang dibuat Sequelize (`"OrderBook"`),
+  // bukan nama tabel, karena `created_at` juga ada di tabel yang di-JOIN.
+  const tzLiteral = sequelize.escape(env.businessTz);
+  const localDate = (op: '>=' | '<=', value: string) =>
+    Sequelize.literal(`("${ORDER_ALIAS}"."created_at" AT TIME ZONE ${tzLiteral})::date ${op} ${sequelize.escape(value)}`);
+  if (params.date_from) conditions.push(localDate('>=', params.date_from) as never);
+  if (params.date_to) conditions.push(localDate('<=', params.date_to) as never);
+
+  const rows = await OrderBook.findAll({
+    where: { [Op.and]: conditions },
+    include: ORDER_INCLUDES,
+    // Semua include 1:1 (belongsTo) -> jumlah baris tidak berubah, LIMIT aman.
+    subQuery: false,
+    order: [['id', 'DESC']],
+    limit: params.limit,
+    offset: params.offset,
+  });
+
+  const list = rows as unknown as OrderBookWithRefs[];
+  const totals = await aggregateItems(list.map((r) => r.id));
+  return list.map((row) => toOrderRow(row, totals.get(row.id) ?? EMPTY_AGG));
 }
 
 /* ============================== detail ============================== */
 
-export async function getOrderBook(id: number, client: PoolClient | null = null): Promise<OrderBookDetail> {
-  const runner = client ? client.query.bind(client) : pool.query.bind(pool);
-  const head = await runner(`${SELECT_ORDER_BOOK} WHERE ob.id = $1`, [id]);
-  if (!head.rows[0]) throw new ApiError('ORDER_NOT_FOUND', `Order book id=${id} tidak ditemukan`);
-  const items = await runner(`${SELECT_ITEM} WHERE i.order_book_id = $1 ORDER BY i.id ASC`, [id]);
-  return { ...(head.rows[0] as OrderBookRow), items: items.rows as OrderBookItemRow[] };
+/**
+ * Header + item satu order. Boleh dipanggil dalam transaksi (langsung setelah
+ * create/patch/delete/status/convert) supaya respons sudah memuat efek baris baru.
+ */
+async function fetchDetail(transaction: Transaction | null, id: number): Promise<OrderBookDetail> {
+  const head = await OrderBook.findByPk(id, { include: ORDER_INCLUDES, transaction });
+  if (!head) throw new ApiError('ORDER_NOT_FOUND', `Order book id=${id} tidak ditemukan`);
+
+  const items = await OrderBookItem.findAll({
+    where: { order_book_id: id },
+    order: [['id', 'ASC']],
+    transaction,
+  });
+
+  const itemRows = items.map(toItemRow);
+  return {
+    ...toOrderRow(
+      head as unknown as OrderBookWithRefs,
+      {
+        count: itemRows.length,
+        unmatched: itemRows.filter((i) => !i.matched).length,
+        qty: itemRows.reduce((sum, i) => sum + i.qty, 0),
+        // `Σ qty × unit_price` dibulatkan SEKALI di akhir (setara
+        // `sum(i.qty * i.unit_price)::numeric(14,2)` versi lama), bukan jumlah
+        // dari `subtotal` yang sudah dibulatkan per item.
+        estimated: items.reduce((sum, i) => sum + i.qty * i.unit_price, 0),
+      },
+    ),
+    items: itemRows,
+  };
+}
+
+export async function getOrderBook(id: number): Promise<OrderBookDetail> {
+  return fetchDetail(null, id);
 }
 
 /* ====================== helper: produk & customer ====================== */
@@ -160,59 +337,61 @@ export async function getOrderBook(id: number, client: PoolClient | null = null)
  * Validasi produk + harga snapshot. Server TIDAK menghitung match (itu tugas bot);
  * server hanya memastikan produk yang dikirim bot benar-benar ada & aktif, lalu
  * menyimpan harga_jual saat itu (bukan harga saat order di-convert).
+ *
+ * `Product.scope('withInactive')`: SELECT lama `FROM product WHERE id = $1` tidak
+ * memfilter `is_active`, jadi produk nonaktif harus menghasilkan 400 "tidak aktif"
+ * (bukan "tidak ditemukan") — pesan yang sama seperti versi lama.
  */
-async function resolveProduct(
-  client: PoolClient,
-  productId: number,
-): Promise<{ id: number; name: string; unit_price: number }> {
-  const res = await client.query<{ id: number; name: string; harga_jual: number | null; is_active: boolean }>(
-    `SELECT id, name, harga_jual, is_active FROM product WHERE id = $1`,
-    [productId],
-  );
-  const p = res.rows[0];
-  if (!p) throw new ApiError('VALIDATION_ERROR', `Produk id=${productId} tidak ditemukan`);
-  if (!p.is_active) {
-    throw new ApiError('VALIDATION_ERROR', `Produk id=${productId} ("${p.name}") tidak aktif; tidak bisa dipakai di order book`);
+async function resolveProduct(transaction: Transaction, productId: number): Promise<{ id: number; name: string; unit_price: number }> {
+  const product = await Product.scope('withInactive').findByPk(productId, { transaction });
+  if (!product) throw new ApiError('VALIDATION_ERROR', `Produk id=${productId} tidak ditemukan`);
+  if (!product.is_active) {
+    throw new ApiError('VALIDATION_ERROR', `Produk id=${productId} ("${product.name}") tidak aktif; tidak bisa dipakai di order book`);
   }
-  return { id: p.id, name: p.name, unit_price: Number(p.harga_jual ?? 0) };
+  return { id: product.id, name: product.name ?? '', unit_price: Number(product.harga_jual ?? 0) };
 }
 
-/** id user sistem `bot` (seed migration 0009) - jadi `created_by` order dari internal key. */
-export async function getBotUserId(client: PoolClient | null = null): Promise<number> {
-  const runner = client ? client.query.bind(client) : pool.query.bind(pool);
-  const res = await runner<{ id: number }>(
-    `SELECT id FROM user_account WHERE lower(username) = 'bot' ORDER BY id LIMIT 1`,
-  );
-  if (!res.rows[0]) {
-    throw new ApiError('INTERNAL_ERROR', 'User sistem "bot" belum ada; jalankan `npm run migrate` lebih dulu');
+/** id user sistem `bot` (seeder `202610110004-bot-user`) - jadi `created_by` order dari internal key. */
+export async function getBotUserId(transaction: Transaction | null = null): Promise<number> {
+  const bot = await UserAccount.findOne({
+    where: { username: { [Op.iLike]: 'bot' } },
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  if (!bot) {
+    throw new ApiError('INTERNAL_ERROR', 'User sistem "bot" belum ada; jalankan `npm run db:seed` lebih dulu');
   }
-  return res.rows[0].id;
+  return bot.id;
 }
 
 /**
- * Customer by nomor WA, auto-register bila belum ada. `pg_advisory_xact_lock` per nomor
- * supaya 2 request bersamaan (2 chat masuk bersamaan) tidak membuat customer ganda.
+ * Customer by nomor WA, auto-register bila belum ada.
+ *
+ * `pg_advisory_xact_lock(hashtext(phone))` per nomor supaya 2 request bersamaan
+ * (2 chat masuk bersamaan) tidak membuat customer ganda. Ini satu-satunya SQL
+ * mentah yang tersisa di service ini (hybrid): fungsi advisory lock tidak punya
+ * padanan ORM, dan pemanggilnya dijaga `hashtext()` — nilainya tidak masuk string
+ * SQL. Baris customer sendiri dibaca/tulis lewat model `Customer` seperti service
+ * lain (MP-2 dst).
  */
 async function ensureCustomer(
-  client: PoolClient,
+  transaction: Transaction,
   phone: string,
   nameFromRequest: string | null,
 ): Promise<{ id: number; name: string }> {
-  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [phone]);
+  await sequelize.query('SELECT pg_advisory_xact_lock(hashtext($1))', {
+    bind: [phone],
+    type: QueryTypes.SELECT,
+    transaction,
+  });
 
-  const found = await client.query<{ id: number; name: string }>(
-    `SELECT id, name FROM customer WHERE phone = $1 ORDER BY id LIMIT 1`,
-    [phone],
-  );
-  if (found.rows[0]) return found.rows[0];
+  const found = await Customer.findOne({ where: { phone }, order: [['id', 'ASC']], transaction });
+  if (found) return { id: found.id, name: found.name ?? '' };
 
   // Tanpa nama profil dari WA, tetap dibuat supaya pesanan punya identitas (nama kasual).
   const name = nameFromRequest?.trim() || `WA ${phone}`;
-  const ins = await client.query<{ id: number; name: string }>(
-    `INSERT INTO customer (name, phone) VALUES ($1, $2) RETURNING id, name`,
-    [name, phone],
-  );
-  return ins.rows[0]!;
+  const created = await Customer.create({ name, phone }, { transaction });
+  return { id: created.id, name: created.name ?? '' };
 }
 
 /* ====================== POST /order-books (buat) ====================== */
@@ -228,67 +407,63 @@ async function ensureCustomer(
  * Satu transaksi DB: header + items + (customer baru) atomic.
  */
 export async function createOrderBook(input: OrderBookInput, createdByUserId: number | null): Promise<OrderBookDetail> {
-  return withTx(async (client) => {
-    const createdBy = createdByUserId ?? (await getBotUserId(client));
-    const customer = await ensureCustomer(client, input.customer_phone, input.customer_name ?? null);
+  try {
+    return await withOrmTx(async (transaction) => {
+      const createdBy = createdByUserId ?? (await getBotUserId(transaction));
+      const customer = await ensureCustomer(transaction, input.customer_phone, input.customer_name ?? null);
 
-    const orderNo = await nextDocNo(client, 'order', env.businessTz);
-    const head = await client.query<{ id: number }>(
-      `INSERT INTO order_books
-         (order_no, customer_id, customer_name, customer_phone, raw_message, note, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id`,
-      [
-        orderNo,
-        customer.id,
-        input.customer_name?.trim() || customer.name,
-        input.customer_phone,
-        input.raw_message,
-        input.note ?? null,
-        createdBy,
-      ],
-    );
-    const orderId = head.rows[0]!.id;
-
-    for (const item of input.items) {
-      let productId: number | null = null;
-      let unitPrice = 0;
-      if (item.product_id !== undefined && item.product_id !== null) {
-        const p = await resolveProduct(client, item.product_id);
-        productId = p.id;
-        unitPrice = p.unit_price;
-      }
-      await client.query(
-        `INSERT INTO order_book_items
-           (order_book_id, product_id, product_name, raw_text, qty, unit_price, matched, match_score)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [
-          orderId,
-          productId,
-          item.product_name.trim(),
-          item.raw_text ?? null,
-          round3(item.qty),
-          unitPrice,
-          productId !== null,
-          item.match_score ?? null,
-        ],
+      const orderNo = await nextDocNo(transaction, 'order', env.businessTz);
+      const order = await OrderBook.create(
+        {
+          order_no: orderNo,
+          status: 'PENDING',
+          customer_id: customer.id,
+          customer_name: input.customer_name?.trim() || customer.name,
+          customer_phone: input.customer_phone,
+          raw_message: input.raw_message,
+          note: input.note ?? null,
+          created_by: createdBy,
+        },
+        { transaction },
       );
-    }
 
-    return getOrderBook(orderId, client);
-  }, 'order-book-create');
+      for (const item of input.items) {
+        let productId: number | null = null;
+        let unitPrice = 0;
+        if (item.product_id !== undefined && item.product_id !== null) {
+          const p = await resolveProduct(transaction, item.product_id);
+          productId = p.id;
+          unitPrice = p.unit_price;
+        }
+        await OrderBookItem.create(
+          {
+            order_book_id: order.id,
+            product_id: productId,
+            product_name: item.product_name.trim(),
+            raw_text: item.raw_text ?? null,
+            qty: round3(item.qty),
+            unit_price: unitPrice,
+            matched: productId !== null,
+            match_score: item.match_score ?? null,
+          },
+          { transaction },
+        );
+      }
+
+      return fetchDetail(transaction, order.id);
+    }, 'order-book-create');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
 /* ================== kunci order + item (PATCH/DELETE/status/convert) ================== */
 
 /** Kunci baris order (FOR UPDATE) supaya transisi status & edit item tidak balapan. */
-async function lockOrder(client: PoolClient, orderId: number): Promise<{ id: number; status: OrderStatus }> {
-  const res = await client.query<{ id: number; status: OrderStatus }>(
-    `SELECT id, status FROM order_books WHERE id = $1 FOR UPDATE`,
-    [orderId],
-  );
-  if (!res.rows[0]) throw new ApiError('ORDER_NOT_FOUND', `Order book id=${orderId} tidak ditemukan`);
-  return res.rows[0];
+async function lockOrder(transaction: Transaction, orderId: number): Promise<OrderBook> {
+  const order = await OrderBook.findByPk(orderId, { transaction, lock: transaction.LOCK.UPDATE });
+  if (!order) throw new ApiError('ORDER_NOT_FOUND', `Order book id=${orderId} tidak ditemukan`);
+  return order;
 }
 
 /** Item hanya boleh diubah selama order masih bisa dikerjakan kasir. */
@@ -299,19 +474,21 @@ function assertEditable(status: OrderStatus): void {
 }
 
 /** Kunci 1 item milik order tsb; item dari order lain dianggap tidak ada. */
-async function lockItem(
-  client: PoolClient,
-  orderId: number,
-  itemId: number,
-): Promise<{ id: number; product_id: number | null; product_name: string; qty: number }> {
-  const res = await client.query<{ id: number; product_id: number | null; product_name: string; qty: number }>(
-    `SELECT id, product_id, product_name, qty FROM order_book_items WHERE id = $1 AND order_book_id = $2 FOR UPDATE`,
-    [itemId, orderId],
-  );
-  if (!res.rows[0]) {
+async function lockItem(transaction: Transaction, orderId: number, itemId: number): Promise<OrderBookItem> {
+  const item = await OrderBookItem.findOne({
+    where: { id: itemId, order_book_id: orderId },
+    transaction,
+    lock: transaction.LOCK.UPDATE,
+  });
+  if (!item) {
     throw new ApiError('ORDER_ITEM_NOT_FOUND', `Item id=${itemId} bukan item dari order book id=${orderId}`);
   }
-  return res.rows[0];
+  return item;
+}
+
+/** Sentuh `updated_at` order (kolomnya dipakai FE untuk tahu order berubah). */
+async function touchOrder(transaction: Transaction, order: OrderBook): Promise<void> {
+  await order.update({ updated_at: new Date() }, { transaction });
 }
 
 /* ==================== PATCH /order-books/{id}/items/{itemId} ==================== */
@@ -327,60 +504,64 @@ export async function patchOrderBookItem(
   itemId: number,
   patch: { product_id?: number | null; qty?: number },
 ): Promise<OrderBookDetail> {
-  return withTx(async (client) => {
-    const order = await lockOrder(client, orderId);
-    assertEditable(order.status);
-    await lockItem(client, orderId, itemId);
+  try {
+    return await withOrmTx(async (transaction) => {
+      const order = await lockOrder(transaction, orderId);
+      assertEditable(order.status);
+      const item = await lockItem(transaction, orderId, itemId);
 
-    const sets: string[] = [];
-    const args: unknown[] = [];
-    if (patch.product_id !== undefined && patch.product_id !== null) {
-      const p = await resolveProduct(client, patch.product_id);
-      args.push(p.id);
-      sets.push(`product_id = $${args.length}`);
-      args.push(p.name);
-      sets.push(`product_name = $${args.length}`);
-      args.push(p.unit_price);
-      sets.push(`unit_price = $${args.length}`);
-      sets.push('matched = true');
-    }
-    if (patch.qty !== undefined) {
-      args.push(round3(patch.qty));
-      sets.push(`qty = $${args.length}`);
-    }
+      const changes: Partial<{
+        product_id: number | null;
+        product_name: string;
+        unit_price: number;
+        qty: number;
+        matched: boolean;
+      }> = {};
 
-    args.push(itemId, orderId);
-    await client.query(
-      `UPDATE order_book_items SET ${sets.join(', ')}
-        WHERE id = $${args.length - 1} AND order_book_id = $${args.length}`,
-      args as never[],
-    );
-    await client.query(`UPDATE order_books SET updated_at = now() WHERE id = $1`, [orderId]);
-    return getOrderBook(orderId, client);
-  }, 'order-book-patch-item');
+      if (patch.product_id !== undefined && patch.product_id !== null) {
+        const p = await resolveProduct(transaction, patch.product_id);
+        changes.product_id = p.id;
+        changes.product_name = p.name;
+        changes.unit_price = p.unit_price;
+        changes.matched = true;
+      }
+      if (patch.qty !== undefined) changes.qty = round3(patch.qty);
+
+      if (Object.keys(changes).length === 0) {
+        throw new ApiError('VALIDATION_ERROR', 'Tidak ada field yang bisa diperbarui (product_id / qty)');
+      }
+
+      await item.update(changes, { transaction });
+      await touchOrder(transaction, order);
+      return fetchDetail(transaction, orderId);
+    }, 'order-book-patch-item');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
 /* =================== DELETE /order-books/{id}/items/{itemId} =================== */
 
 /** Order minimal 1 item (order tanpa item tidak ada artinya) -> 422 ORDER_LAST_ITEM. */
 export async function deleteOrderBookItem(orderId: number, itemId: number): Promise<OrderBookDetail> {
-  return withTx(async (client) => {
-    const order = await lockOrder(client, orderId);
-    assertEditable(order.status);
-    await lockItem(client, orderId, itemId);
+  try {
+    return await withOrmTx(async (transaction) => {
+      const order = await lockOrder(transaction, orderId);
+      assertEditable(order.status);
+      const item = await lockItem(transaction, orderId, itemId);
 
-    const cnt = await client.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM order_book_items WHERE order_book_id = $1`,
-      [orderId],
-    );
-    if ((cnt.rows[0]?.n ?? 0) <= 1) {
-      throw new ApiError('ORDER_LAST_ITEM', 'Order book harus punya minimal 1 item; item terakhir tidak bisa dihapus');
-    }
+      const total = await OrderBookItem.count({ where: { order_book_id: orderId }, transaction });
+      if (total <= 1) {
+        throw new ApiError('ORDER_LAST_ITEM', 'Order book harus punya minimal 1 item; item terakhir tidak bisa dihapus');
+      }
 
-    await client.query(`DELETE FROM order_book_items WHERE id = $1 AND order_book_id = $2`, [itemId, orderId]);
-    await client.query(`UPDATE order_books SET updated_at = now() WHERE id = $1`, [orderId]);
-    return getOrderBook(orderId, client);
-  }, 'order-book-delete-item');
+      await item.destroy({ transaction });
+      await touchOrder(transaction, order);
+      return fetchDetail(transaction, orderId);
+    }, 'order-book-delete-item');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
 /* ==================== POST /order-books/{id}/status ==================== */
@@ -388,7 +569,7 @@ export async function deleteOrderBookItem(orderId: number, itemId: number): Prom
 /**
  * Transisi status oleh kasir:
  *   PENDING -> PROCESSING (kasir mulai kerjakan)
- *   PENDING/PROCESSING -> CANCELLED (alasan wajib, disimpan di `note`)
+ *   PENDING/PROCESSING -> CANCELLED (alasan wajib, ditempel ke `note`)
  * DONE hanya lewat `/convert`; CANCELLED bersifat final.
  */
 export async function setOrderBookStatus(
@@ -397,42 +578,51 @@ export async function setOrderBookStatus(
   reason: string | null,
   userId: number,
 ): Promise<OrderBookDetail> {
-  return withTx(async (client) => {
-    const order = await lockOrder(client, orderId);
+  try {
+    return await withOrmTx(async (transaction) => {
+      const order = await lockOrder(transaction, orderId);
 
-    if (status === 'PROCESSING') {
-      if (order.status !== 'PENDING') {
+      if (status === 'PROCESSING') {
+        if (order.status !== 'PENDING') {
+          throw new ApiError(
+            'ORDER_STATUS_TRANSITION',
+            `Hanya order PENDING yang bisa jadi PROCESSING (sekarang ${order.status})`,
+          );
+        }
+      } else if (order.status !== 'PENDING' && order.status !== 'PROCESSING') {
         throw new ApiError(
           'ORDER_STATUS_TRANSITION',
-          `Hanya order PENDING yang bisa jadi PROCESSING (sekarang ${order.status})`,
+          `Order book berstatus ${order.status} tidak bisa dibatalkan lagi`,
         );
       }
-    } else if (order.status !== 'PENDING' && order.status !== 'PROCESSING') {
-      throw new ApiError(
-        'ORDER_STATUS_TRANSITION',
-        `Order book berstatus ${order.status} tidak bisa dibatalkan lagi`,
-      );
-    }
 
-    await client.query(
-      `UPDATE order_books
-          SET status = $2, processed_by = $3, updated_at = now(),
-              note = CASE
-                WHEN $4::text IS NULL THEN note
-                WHEN note IS NULL OR note = '' THEN $4
-                ELSE note || ' | ' || $4
-              END
-        WHERE id = $1`,
-      [orderId, status, userId, reason],
-    );
-    return getOrderBook(orderId, client);
-  }, 'order-book-status');
+      // Alasan pembatalan ditumpuk ke `note` (pola `note || ' | ' || reason` versi lama);
+      // tanpa reason, `note` tidak berubah sama sekali.
+      let note = order.note;
+      if (reason) {
+        note = !note ? reason : `${note} | ${reason}`;
+      }
+
+      await order.update(
+        { status, processed_by: userId, updated_at: new Date(), ...(reason ? { note } : {}) },
+        { transaction },
+      );
+      return fetchDetail(transaction, orderId);
+    }, 'order-book-status');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
 /* ==================== POST /order-books/{id}/convert ==================== */
 
 /**
  * Tutup order jadi DONE setelah kasir menagih di POS biasa.
+ *
+ * Kasir sudah melakukan `POST /sales` lebih dulu (transaksi sendiri, MP-4) lalu
+ * mengaitkan penjualan itu lewat `sale_id` — order book TIDAK membuat penjualan
+ * sendiri (kontrak openapi `OrderBookConvertInput` mewajibkan `sale_id`, dan stok
+ * hanya boleh berkurang satu kali lewat trigger penjualan).
  *
  * Guard:
  *  - order tidak boleh CANCELLED (`409 ORDER_STATUS_TRANSITION`)
@@ -446,45 +636,39 @@ export async function convertOrderBook(
   saleId: number,
   userId: number,
 ): Promise<{ order: OrderBookDetail; alreadyDone: boolean }> {
-  return withTx(async (client) => {
-    const current = await client.query<{ id: number; status: OrderStatus; sale_id: number | null }>(
-      `SELECT id, status, sale_id FROM order_books WHERE id = $1 FOR UPDATE`,
-      [orderId],
-    );
-    const order = current.rows[0];
-    if (!order) throw new ApiError('ORDER_NOT_FOUND', `Order book id=${orderId} tidak ditemukan`);
+  try {
+    return await withOrmTx(async (transaction) => {
+      const order = await lockOrder(transaction, orderId);
 
-    if (order.status === 'DONE') {
-      if (Number(order.sale_id) === saleId) {
-        return { order: await getOrderBook(orderId, client), alreadyDone: true };
+      if (order.status === 'DONE') {
+        if (Number(order.sale_id) === saleId) {
+          return { order: await fetchDetail(transaction, orderId), alreadyDone: true };
+        }
+        throw new ApiError(
+          'ORDER_ALREADY_DONE',
+          `Order book sudah DONE ke penjualan #${order.sale_id}; tidak bisa di-convert ke #${saleId}`,
+        );
       }
-      throw new ApiError(
-        'ORDER_ALREADY_DONE',
-        `Order book sudah DONE ke penjualan #${order.sale_id}; tidak bisa di-convert ke #${saleId}`,
-      );
-    }
-    if (order.status === 'CANCELLED') {
-      throw new ApiError('ORDER_STATUS_TRANSITION', 'Order book dibatalkan; tidak bisa di-convert');
-    }
+      if (order.status === 'CANCELLED') {
+        throw new ApiError('ORDER_STATUS_TRANSITION', 'Order book dibatalkan; tidak bisa di-convert');
+      }
 
-    const sale = await client.query<{ id: number; status: string }>(`SELECT id, status FROM sales WHERE id = $1`, [
-      saleId,
-    ]);
-    const s = sale.rows[0];
-    if (!s) throw new ApiError('ORDER_CONVERT_INVALID', `Penjualan id=${saleId} tidak ditemukan`);
-    if (s.status !== 'COMPLETED') {
-      throw new ApiError(
-        'ORDER_CONVERT_INVALID',
-        `Penjualan id=${saleId} berstatus ${s.status}; hanya penjualan COMPLETED yang bisa dipakai`,
-      );
-    }
+      const sale = await Sale.findByPk(saleId, { attributes: ['id', 'status'], transaction });
+      if (!sale) throw new ApiError('ORDER_CONVERT_INVALID', `Penjualan id=${saleId} tidak ditemukan`);
+      if (sale.status !== 'COMPLETED') {
+        throw new ApiError(
+          'ORDER_CONVERT_INVALID',
+          `Penjualan id=${saleId} berstatus ${sale.status}; hanya penjualan COMPLETED yang bisa dipakai`,
+        );
+      }
 
-    await client.query(
-      `UPDATE order_books
-          SET status = 'DONE', sale_id = $2, processed_by = $3, updated_at = now()
-        WHERE id = $1`,
-      [orderId, saleId, userId],
-    );
-    return { order: await getOrderBook(orderId, client), alreadyDone: false };
-  }, 'order-book-convert');
+      await order.update(
+        { status: 'DONE', sale_id: saleId, processed_by: userId, updated_at: new Date() },
+        { transaction },
+      );
+      return { order: await fetchDetail(transaction, orderId), alreadyDone: false };
+    }, 'order-book-convert');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }

@@ -1,7 +1,9 @@
-import { pool } from '../config/db.js';
+import { QueryTypes } from 'sequelize';
+import { sequelize } from '../db/sequelize.js';
 
 /**
- * Katalog ringkas untuk integrasi server-to-server (bot WA `internal/catalog`).
+ * Katalog ringkas untuk integrasi server-to-server (bot WA `internal/catalog`),
+ * di atas Sequelize (MP-7).
  *
  * Tidak sama dengan `GET /products`:
  *  - tidak butuh JWT, hanya `X-Internal-Key` (bot tidak punya akun kasir),
@@ -10,6 +12,14 @@ import { pool } from '../config/db.js';
  *
  * Hanya produk AKTIF. Query mengikuti pola wajib di stock.service.ts (fase.md §0):
  * stok dihitung dari `SUM(qty_remaining)` per batch (angka murni hasil trigger DB).
+ *
+ * SQL-nya SAMA PERSIS dengan versi raw SQL lama
+ * (`git show e33b3b5:src/services/internal-catalog.service.ts`) dan dijalankan lewat
+ * `sequelize.query` + `QueryTypes.SELECT` (pola hybrid yang sama seperti
+ * `stock.service.ts`/`report.service.ts`): agregasi LEFT JOIN + GROUP BY produk
+ * tidak ditulis ulang sebagai literal/fragment ORM, supaya bentuk hasil & urutan
+ * baris benar-benar identik dengan versi lama dan `harga_beli` tidak pernah punya
+ * jalan masuk ke response. Tidak ada parameter dari user -> tanpa risiko injeksi.
  */
 export interface InternalCatalogItem {
   id: number;
@@ -28,7 +38,7 @@ export interface InternalCatalogItem {
 }
 
 export async function getInternalCatalog(): Promise<InternalCatalogItem[]> {
-  const res = await pool.query<InternalCatalogItem>(
+  const rows = (await sequelize.query(
     `SELECT p.id, p.sku, p.barcode, p.name, p.unit, c.name AS category_name,
             p.harga_jual, p.unit_conversions,
             COALESCE(SUM(b.qty_remaining), 0)::numeric(14,3) AS qty_on_hand,
@@ -39,6 +49,7 @@ export async function getInternalCatalog(): Promise<InternalCatalogItem[]> {
       WHERE p.is_active = true
       GROUP BY p.id, c.name
       ORDER BY p.name ASC`,
-  );
-  return res.rows;
+    { type: QueryTypes.SELECT },
+  )) as unknown as InternalCatalogItem[];
+  return rows;
 }
