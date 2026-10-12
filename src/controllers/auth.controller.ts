@@ -27,7 +27,10 @@ export async function logout(req: Request, res: Response): Promise<void> {
   res.status(200).json({ ok: true, message: 'Logout berhasil, refresh token dicabut' });
 }
 
+/** `GET /auth/me` — profil user + status subscription (MP-8).
+ *  Field `user` tidak berubah (kontrak FE lama); tambahan `modules`, `account`,
+ *  `hosting_mode` bersifat additive (plan-subscription-tiering.md §7). */
 export async function me(req: Request, res: Response): Promise<void> {
-  const user = await authService.me(req.user!.id);
-  res.status(200).json({ user });
+  const { user, subscription } = await authService.me(req.user!.id);
+  res.status(200).json({ user, ...subscription });
 }

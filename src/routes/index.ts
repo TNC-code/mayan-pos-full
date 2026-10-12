@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { asyncHandler as h, validateBody as vBody, validateQuery as vQuery } from '../middleware/validate.js';
 import { requireAuth, requireRole, requireIdempotencyKey } from '../middleware/auth.js';
 import { requireInternalKey, requireInternalKeyOrKasir } from '../middleware/internal-key.js';
+import { requireActiveAccount } from '../middleware/account.js';
+import { requireModule } from '../middleware/module.js';
 import { rateLimit } from '../middleware/rate-limit.js';
 import * as authCtrl from '../controllers/auth.controller.js';
 import * as masterCtrl from '../controllers/master.controller.js';
@@ -30,6 +32,20 @@ import * as S from '../controllers/schemas.js';
  * **Amandemen (revisi user, FE-11):** pengeluaran operasional jadi **OWNER sepenuhnya** —
  * input (`POST`/`PATCH /expenses`) ikut pindah ke OWNER. Kasir tidak punya menu/kapasitas
  * pengeluaran apa pun (list, input, ubah) → 403 di ketiga endpoint. Semua mutasi lain tetap KASIR.
+ *
+ * **Gate subscription per modul (MP-8, plan-subscription-tiering.md):**
+ *   `requireActiveAccount` (status trial/expired/suspend) dipasang global setelah
+ *   `/auth/me` + `/auth/logout`; `requireModule(code)` dipasang per-endpoint —
+ *   `reports` → `/reports/*` · `shift` → buka/tutup shift · `wa_order` → `/order-books*`
+ *   + `/internal/catalog` · `retur` → `/supplier-returns*`.
+ *   Yang SENGAJA TIDAK digate (isi Paket Inventaris/paket inti): products, sales,
+ *   stock, alerts, expenses, purchases, customers, payment-methods, opnames, store,
+ *   cash-sessions list/detail.
+ *
+ *   CATATAN pra-auth: `POST /order-books` & `GET /internal/catalog` didaftarkan
+ *   SEBELUM `r.use(requireActiveAccount)`, jadi tidak terjangkau guard siklus akun.
+ *   Keduanya dilindungi karena `requireModule` memanggil `guardAccountStatus`
+ *   (lihat middleware/module.ts).
  */
 const KASIR = requireRole('KASIR');
 const OWNER = requireRole('OWNER');
@@ -46,16 +62,35 @@ export function buildRouter(): Router {
   // POST /order-books HARUS didaftarkan SEBELUM `r.use(requireAuth)` di bawah: endpoint ini
   // punya dua jalur auth - header `X-Internal-Key` (bot WhatsApp) ATAU login kasir.
   // Middleware requireInternalKeyOrKasir() yang menentukannya (lihat middleware/internal-key.ts).
-  r.post('/order-books', requireInternalKeyOrKasir(), vBody(S.orderBookCreateSchema), h(orderBookCtrl.createOrderBook));
+  //
+  // Gate modul `wa_order` tetap dipasang di sini, dan sekarang ITU SAJA yang
+  // melindungi jalur pra-auth ini (kategori MP-8): `requireModule` memanggil
+  // `guardAccountStatus` setelah `loadAccount`, jadi `requireActiveAccount` yang
+  // global TIDAK menjangkau route ini — tanpa itu akun SUSPENDED masih bisa baca
+  // katalog & membuat order book, dan akun EXPIRED masih bisa mutasi order book
+  // (padahal EXPIRED = read-only). Gate modul ini tidak butuh JWT: `loadAccount`
+  // hanya membaca `store_profile`, jadi bot WA kena gate juga.
+  r.post('/order-books', requireInternalKeyOrKasir(), requireModule('wa_order'), vBody(S.orderBookCreateSchema), h(orderBookCtrl.createOrderBook));
 
   /* ------------------- katalog internal (bot WA, WA-1) ------------------- */
   // Bot matcher butuh daftar produk + stok, tapi tidak punya JWT kasir -> endpoint ini
   // HANYA menerima `X-Internal-Key` (tidak dibuka ke sesi kasir) dan tidak mengirim harga beli.
-  r.get('/internal/catalog', requireInternalKey, h(internalCatalogCtrl.getCatalog));
+  r.get('/internal/catalog', requireInternalKey, requireModule('wa_order'), h(internalCatalogCtrl.getCatalog));
 
   r.use(requireAuth);
+
+  /* -------- auth/me & logout: SEBELUM gate siklus akun (MP-8) -------- */
+  // Saat akun EXPIRED/SUSPENDED, app tetap harus bisa membaca statusnya dan logout.
   r.get('/auth/me', h(authCtrl.me));
   r.post('/auth/logout', vBody(S.refreshTokenSchema), h(authCtrl.logout));
+
+  /* -------------- guard siklus akun (trial/expired/suspend) --------------
+   * SUSPENDED -> semua endpoint di bawah 403 AKUN_SUSPENDED.
+   * EXPIRED   -> read-only: GET lolos, semua mutasi 403 TRIAL_EXPIRED.
+   * Gate modul (`requireModule`) dipasang per-endpoint di bawah, selalu SEBELUM
+   * guard role KASIR/OWNER (urutan plan §7: trial -> modul -> role).
+   */
+  r.use(requireActiveAccount);
 
   /* ----------------------------- products ----------------------------- */
   r.get('/products', vQuery(S.productListSchema), h(masterCtrl.listProducts));
@@ -117,10 +152,12 @@ export function buildRouter(): Router {
   r.post('/sales/:id/refund', KASIR, requireIdempotencyKey, vBody(S.voidSchema), h(saleCtrl.refundSale));
 
   /* --------------------------- cash sessions --------------------------- */
+  // Buka/tutup shift = modul `shift` (multi-kasir & shift); daftar/detail dibaca
+  // semua role (tidak digate: dipakai layar kasir untuk monitoring sesi).
   r.get('/cash-sessions', vQuery(S.cashListSchema), h(cashCtrl.listSessions));
   r.get('/cash-sessions/:id', h(cashCtrl.getSession));
-  r.post('/cash-sessions/open', KASIR, vBody(S.cashOpenSchema), h(cashCtrl.openSession));
-  r.post('/cash-sessions/:id/close', KASIR, vBody(S.cashCloseSchema), h(cashCtrl.closeSession));
+  r.post('/cash-sessions/open', requireModule('shift'), KASIR, vBody(S.cashOpenSchema), h(cashCtrl.openSession));
+  r.post('/cash-sessions/:id/close', requireModule('shift'), KASIR, vBody(S.cashCloseSchema), h(cashCtrl.closeSession));
 
   /* ------------------------------ opnames ----------------------------- */
   r.get('/opnames', vQuery(S.opnameListSchema), h(opnameCtrl.listOpnames));
@@ -129,19 +166,23 @@ export function buildRouter(): Router {
 
   /* ------------------------- retur distributor ------------------------ */
   // Input retur + settle = operasi kasir (RBAC KASIR); daftar/detail dibaca semua role.
-  r.post('/supplier-returns', KASIR, requireIdempotencyKey, vBody(S.supplierReturnCreateSchema), h(supplierReturnCtrl.createSupplierReturn));
-  r.get('/supplier-returns', vQuery(S.supplierReturnListSchema), h(supplierReturnCtrl.listSupplierReturns));
-  r.get('/supplier-returns/:id', h(supplierReturnCtrl.getSupplierReturn));
-  r.post('/supplier-returns/:id/settle', KASIR, requireIdempotencyKey, vBody(S.supplierReturnSettleSchema), h(supplierReturnCtrl.settleSupplierReturn));
+  // Seluruh fitur retur = modul `retur` (plan-subscription-tiering.md §3), termasuk
+  // daftar & detail: data retur tidak dibaca tanpa modul (garis pemisah jelas).
+  r.post('/supplier-returns', requireModule('retur'), KASIR, requireIdempotencyKey, vBody(S.supplierReturnCreateSchema), h(supplierReturnCtrl.createSupplierReturn));
+  r.get('/supplier-returns', requireModule('retur'), vQuery(S.supplierReturnListSchema), h(supplierReturnCtrl.listSupplierReturns));
+  r.get('/supplier-returns/:id', requireModule('retur'), h(supplierReturnCtrl.getSupplierReturn));
+  r.post('/supplier-returns/:id/settle', requireModule('retur'), KASIR, requireIdempotencyKey, vBody(S.supplierReturnSettleSchema), h(supplierReturnCtrl.settleSupplierReturn));
 
   /* ------------- OWNER only (RBAC) =------------ */
   // Pengeluaran operasional = OWNER penuh (amandemen FE-11): kasir tidak boleh
-  // melihat maupun menginput opex; seluruh `/reports/*` juga khusus OWNER.
+  // melihat maupun menginput opex; seluruh `/reports/*` khusus OWNER + modul `reports`.
+  // Gate modul ditulis SEBELUM OWNER (urutan plan §7) supaya kasir yang belum punya
+  // modul tetap melihat 403 MODULE_NOT_ACTIVE + meta upsell, bukan 403 role.
   r.get('/expenses', OWNER, vQuery(S.expenseListSchema), h(expenseCtrl.listExpenses));
   r.get('/expenses/:id', OWNER, h(expenseCtrl.getExpense));
-  r.get('/reports/pnl', OWNER, vQuery(S.pnlQuerySchema), h(expenseCtrl.pnl));
-  r.get('/reports/dashboard', OWNER, h(expenseCtrl.dashboard));
-  r.get('/reports/opname', OWNER, vQuery(S.opnameReportQuerySchema), h(expenseCtrl.opnameReport));
+  r.get('/reports/pnl', requireModule('reports'), OWNER, vQuery(S.pnlQuerySchema), h(expenseCtrl.pnl));
+  r.get('/reports/dashboard', requireModule('reports'), OWNER, h(expenseCtrl.dashboard));
+  r.get('/reports/opname', requireModule('reports'), OWNER, vQuery(S.opnameReportQuerySchema), h(expenseCtrl.opnameReport));
   // Semua role boleh baca (dipakai layar kasir untuk monitoring stok & expiring).
   r.get('/alerts', h(expenseCtrl.alerts));
 
@@ -154,15 +195,15 @@ export function buildRouter(): Router {
   r.patch('/store', KASIR, vBody(S.storeUpdateSchema), h(storeCtrl.updateStore));
 
   /* ----------------------------- order books ----------------------------- */
-  // Daftar/detail dibuka semua role (dipakai layar kasir "Order WA");
-  // mutasi item/status/convert = KASIR. POST-nya sudah didaftarkan di atas
-  // (butuh jalur auth ganda: internal key ATAU kasir).
-  r.get('/order-books', vQuery(S.orderBookListSchema), h(orderBookCtrl.listOrderBooks));
-  r.get('/order-books/:id', h(orderBookCtrl.getOrderBook));
-  r.patch('/order-books/:id/items/:itemId', KASIR, vBody(S.orderBookItemPatchSchema), h(orderBookCtrl.patchOrderBookItem));
-  r.delete('/order-books/:id/items/:itemId', KASIR, h(orderBookCtrl.deleteOrderBookItem));
-  r.post('/order-books/:id/status', KASIR, vBody(S.orderBookStatusSchema), h(orderBookCtrl.setOrderBookStatus));
-  r.post('/order-books/:id/convert', KASIR, vBody(S.orderBookConvertSchema), h(orderBookCtrl.convertOrderBook));
+  // Seluruh fitur Order WA = modul `wa_order` (daftar/detail/mutasi ikut gate —
+  // layar kasir menampilkan menu terkunci + upsell, bukan daftar kosong).
+  // POST-nya sudah didaftarkan di atas (butuh jalur auth ganda: internal key ATAU kasir).
+  r.get('/order-books', requireModule('wa_order'), vQuery(S.orderBookListSchema), h(orderBookCtrl.listOrderBooks));
+  r.get('/order-books/:id', requireModule('wa_order'), h(orderBookCtrl.getOrderBook));
+  r.patch('/order-books/:id/items/:itemId', requireModule('wa_order'), KASIR, vBody(S.orderBookItemPatchSchema), h(orderBookCtrl.patchOrderBookItem));
+  r.delete('/order-books/:id/items/:itemId', requireModule('wa_order'), KASIR, h(orderBookCtrl.deleteOrderBookItem));
+  r.post('/order-books/:id/status', requireModule('wa_order'), KASIR, vBody(S.orderBookStatusSchema), h(orderBookCtrl.setOrderBookStatus));
+  r.post('/order-books/:id/convert', requireModule('wa_order'), KASIR, vBody(S.orderBookConvertSchema), h(orderBookCtrl.convertOrderBook));
 
   return r;
 }
