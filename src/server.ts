@@ -1,6 +1,5 @@
 import { createApp } from './app.js';
 import { env } from './config/env.js';
-import { closePool, pool } from './config/db.js';
 import { sequelize } from './db/sequelize.js';
 import { verifySchema } from './db/check.js';
 import { purgeIdempotencyKeys } from './services/idempotency.service.js';
@@ -38,7 +37,6 @@ async function main(): Promise<void> {
     clearInterval(housekeeping);
     server.close(async () => {
       await sequelize.close();
-      await closePool();
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000).unref();

@@ -11,13 +11,16 @@ import { env } from '../config/env.js';
  *
  * Kontrak angka (penting, jangan dihapus):
  *  openapi.yaml mendeklarasikan uang/qty sebagai `type: number`, dan aplikasi lama
- *  (src/config/db.ts) memasang `types.setTypeParser` global supaya `numeric` dan
- *  `bigint` jadi NUMBER, bukan string. Sequelize v6 memasang parser sendiri per
- *  koneksi (DECIMAL -> string), jadi parser yang sama dipasang ulang di sini lewat
+ *  memasang `types.setTypeParser` global supaya `numeric` dan `bigint` jadi
+ *  NUMBER, bukan string. Sequelize v6 memasang parser sendiri per koneksi
+ *  (DECIMAL -> string), jadi parser yang sama dipasang di sini lewat
  *  `oidParserMap` connection manager. Hasilnya: response ORM identik dengan jalur
  *  raw SQL lama (angka), termasuk di laporan yang masih pakai `sequelize.query`.
  *  Nilai uang TIDAK pernah disimpan lewat ORM (selalu numeric(14,2)/(14,3) di DB),
  *  jadi akurasi tidak terganggu.
+ *  MP-9: `src/config/db.ts` (pool `pg` mentah) sudah dihapus — dua baris
+ *  `types.setTypeParser` di bawah sekarang satu-satunya pemasang parser global,
+ *  dan `npm run db:check` memverifikasi hasilnya (`typeof harga_beli === 'number'`).
  */
 const NUMERIC_OID = 1700;
 const INT8_OID = 20;

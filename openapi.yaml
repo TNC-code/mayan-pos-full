@@ -157,7 +157,10 @@ paths:
   /auth/me:
     get:
       tags: [Auth]
-      summary: Profil user dari token
+      summary: Profil user dari token (+ status subscription)
+      description: |
+        Field `user` TIDAK berubah sejak versi lama. `modules`, `account`, dan `hosting_mode`
+        bersifat **additive** (MP-8) — FE lama yang hanya membaca `user` tetap kompatibel.
       responses:
         '200':
           description: OK
@@ -173,6 +176,27 @@ paths:
                       username: { type: string }
                       full_name: { type: string }
                       role: { type: string, enum: [OWNER, KASIR] }
+                  modules:
+                    type: object
+                    description: 'Entitlement modul langganan (kode -> valid_until + status aktif). Kode yang tidak ada berarti modul belum dibeli = terkunci.'
+                    additionalProperties:
+                      type: object
+                      properties:
+                        valid_until: { type: string, nullable: true }
+                        active: { type: boolean }
+                  account:
+                    type: object
+                    properties:
+                      status: { type: string, enum: [TRIAL, ACTIVE, EXPIRED, SUSPENDED] }
+                      trial_ends_at: { type: string, format: date-time, nullable: true }
+                      trial_days_left: { type: integer, nullable: true }
+                      paket_aktif:
+                        type: string
+                        nullable: true
+                        description: 'Kode paket inti yang dibayar; null selama TRIAL / EXPIRED / SUSPENDED.'
+                  hosting_mode:
+                    type: string
+                    enum: [shared]
 
   /products:
     get:

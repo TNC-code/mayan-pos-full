@@ -1,5 +1,4 @@
 import { QueryTypes, Transaction } from 'sequelize';
-import type { PoolClient } from 'pg';
 
 /**
  * Penomoran dokumen dari SEQUENCE DB (bukan max(timestamp)+1) supaya tetap unik
@@ -11,12 +10,11 @@ import type { PoolClient } from 'pg';
  * nomor saat transaksi rollback — sama seperti versi lama, itu disengaja:
  * nomor tidak boleh dipakai ulang).
  *
- * MP-3: signature menerima DUA jenis runner — `PoolClient` (service yang masih
- * raw SQL: sale, opname, supplier-return, order-book — migrasi bertahap) dan
- * `Transaction` Sequelize (service yang sudah pindah ke ORM, mulai
- * `purchase.service.ts`). SQL-nya sama persis; hanya mekanisme parameterized
- * yang berbeda (`$1` + array `values` untuk pg, `bind` untuk Sequelize).
- *(nextvalue/type tidak pernah digabung ke string -> nol risiko injeksi.)
+ * MP-9: pemanggilnya semua service ber-ORM, jadi satu-satunya runner yang
+ * diterima adalah `Transaction` Sequelize. Jalur `pg.PoolClient` lama dihapus
+ * bersama `config/db.ts`; SQL-nya sendiri tidak berubah sama sekali.
+ *(prefix & nama sequence berasal dari konstanta di bawah — bukan input user —
+ *  jadi nol risiko injeksi.)
  */
 const PREFIX: Record<string, string> = {
   sale: 'INV',
@@ -44,25 +42,20 @@ function docNoSql(kind: DocNoKind): string {
   );
 }
 
-export async function nextDocNo(runner: PoolClient | Transaction, kind: DocNoKind, businessTz: string): Promise<string> {
+export async function nextDocNo(runner: Transaction, kind: DocNoKind, businessTz: string): Promise<string> {
   const sql = docNoSql(kind);
 
-  if (runner instanceof Transaction) {
-    // Catatan: `Transaction.query()` TIDAK ada di Sequelize v6 (hanya v4/v5) dan
-    // `transaction.sequelize` juga belum masuk typings -> jalur ORM adalah
-    // `sequelize.query(sql, { transaction })`, dan reference ke instance
-    // Sequelize-nya diambil dari objek transaction itu sendiri.
-    const { sequelize } = runner as unknown as {
-      sequelize: { query: (sql: string, options: Record<string, unknown>) => Promise<Array<{ doc_no: string }>> };
-    };
-    const rows = await sequelize.query(sql, {
-      bind: [businessTz],
-      type: QueryTypes.SELECT,
-      transaction: runner,
-    });
-    return rows[0]!.doc_no;
-  }
-
-  const res = await runner.query<{ doc_no: string }>(sql, [businessTz]);
-  return res.rows[0]!.doc_no;
+  // `Transaction.query()` TIDAK ada di Sequelize v6 (hanya v4/v5) dan
+  // `transaction.sequelize` juga belum masuk typings -> jalur ORM adalah
+  // `sequelize.query(sql, { transaction })`, dan reference ke instance
+  // Sequelize-nya diambil dari objek transaction itu sendiri.
+  const { sequelize } = runner as unknown as {
+    sequelize: { query: (sql: string, options: Record<string, unknown>) => Promise<Array<{ doc_no: string }>> };
+  };
+  const rows = await sequelize.query(sql, {
+    bind: [businessTz],
+    type: QueryTypes.SELECT,
+    transaction: runner,
+  });
+  return rows[0]!.doc_no;
 }

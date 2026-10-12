@@ -12,6 +12,10 @@ fe/*
 
 # backup database
 scripts/*
+# ...tapi skrip E2E MP-9 + helper DB-nya ikut versioning (kalau tidak, `git add` diam-diam
+# mengabaikannya karena aturan `scripts/*` di atas).
+!scripts/e2e_mayan.ts
+!scripts/db.ts
 backups/
 *.dump
 keys/*

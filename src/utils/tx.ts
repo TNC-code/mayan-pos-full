@@ -1,8 +1,6 @@
-import type { PoolClient } from 'pg';
 import type { Transaction } from 'sequelize';
 import { ApiError } from './errors.js';
 import { isRetryableDbError } from './db-errors.js';
-import { withTransaction } from '../config/db.js';
 import { sequelize } from '../db/sequelize.js';
 
 const MAX_ATTEMPTS = 3;
@@ -29,13 +27,9 @@ export async function withRetry<T>(fn: () => Promise<T>, label: string): Promise
   throw lastErr;
 }
 
-/** Transaksi + retry policy. */
-export function withTx<T>(fn: (client: PoolClient) => Promise<T>, label = 'tx'): Promise<T> {
-  return withRetry(() => withTransaction(fn), label);
-}
-
 /**
- * Transaksi Sequelize + retry policy yang sama persis dengan `withTx` (MP-3).
+ * Transaksi Sequelize + retry policy (MP-3; satu-satunya pembungkus transaksi
+ * sejak MP-9 — `withTx` versi `pg.Pool` beserta `config/db.ts` sudah dihapus).
  *
  * `READ COMMITTED` (default PostgreSQL) + `lock: t.LOCK.UPDATE` saat transaksi
  * memang butuh baris terkunci — kebenaran tetap datang dari row lock, bukan

@@ -1,8 +1,7 @@
-import type { Transaction } from 'sequelize';
-import { pool } from '../config/db.js';
+import { QueryTypes, type Transaction } from 'sequelize';
 import { ApiError } from '../utils/errors.js';
 import { withOrmTx, withRetry } from '../utils/tx.js';
-import { IdempotencyKey } from '../models/index.js';
+import { IdempotencyKey, sequelize } from '../models/index.js';
 
 export interface IdempotentResult<T> {
   replayed: boolean;
@@ -110,12 +109,17 @@ async function readStoredOrm<T>(
 
 /**
  * Housekeeping: hapus key lama (mis. > 24 jam) agar tabel tidak tumbuh.
- * Masih jalur pool (dipanggil dari luar transaksi bisnis, tidak butuh ORM).
+ * Dijalankan DI LUAR transaksi bisnis (interval server), jadi cukup satu
+ * `sequelize.query` — tanpa pool `pg` mentah (MP-9: pool itu sudah dihapus).
  */
 export async function purgeIdempotencyKeys(olderThanHours = 24): Promise<number> {
-  const res = await pool.query(
-    `DELETE FROM public.idempotency_keys WHERE created_at < now() - ($1 || ' hours')::interval`,
-    [olderThanHours],
-  );
-  return res.rowCount ?? 0;
+  const rows = (await sequelize.query<{ n: number }>(
+    `WITH purged AS (
+       DELETE FROM public.idempotency_keys
+        WHERE created_at < now() - (CAST($1 AS text) || ' hours')::interval
+       RETURNING 1
+     ) SELECT COUNT(*)::int AS n FROM purged`,
+    { bind: [olderThanHours], type: QueryTypes.SELECT },
+  )) as unknown as Array<{ n: number }>;
+  return rows[0]?.n ?? 0;
 }

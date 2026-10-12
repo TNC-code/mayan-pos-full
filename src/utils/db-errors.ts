@@ -27,6 +27,12 @@ const MESSAGE_RULES: Array<{ match: RegExp; code: ErrorCode }> = [
   { match: /tidak dapat void penjualan yang sudah dibayar/i, code: 'VOID_NOT_ALLOWED' },
   { match: /void_reason wajib/i, code: 'VOID_REASON_REQUIRED' },
   { match: /voided_by wajib/i, code: 'VOIDED_BY_REQUIRED' },
+  // Pesan trigger `fn_sales_void` (baseline MP-1.2) memakai bentuk berikut; tanpa
+  // aturan ini penolakan transisi status jatuh ke 500 INTERNAL_ERROR.
+  { match: /voided_by dan void_reason wajib diisi/i, code: 'VOIDED_BY_REQUIRED' },
+  { match: /hanya penjualan completed yang dapat di-void/i, code: 'TRANSITION_NOT_ALLOWED' },
+  { match: /transisi .* -> .* tidak diizinkan/i, code: 'TRANSITION_NOT_ALLOWED' },
+  { match: /metadata void tidak boleh diubah/i, code: 'TRANSITION_NOT_ALLOWED' },
   { match: /transisi status penjualan/i, code: 'TRANSITION_NOT_ALLOWED' },
 
   // --- immutability ---
@@ -91,6 +97,12 @@ export function mapDbError(err: unknown): ApiError {
     case '08P01':
     case '08006':
       return new ApiError('DB_UNAVAILABLE', 'Koneksi database terputus');
+    // MP-9: `statement_timeout` (env DB_STATEMENT_TIMEOUT_MS, default 15 detik) dan
+    // `lock_timeout` membatalkan query dari sisi server. Itu BUKAN bug aplikasi:
+    // database tidak menjawab dalam batas waktu -> 503 + retry, bukan 500.
+    case '57014': // query_canceled
+    case '55P03': // lock_not_available (di-handle retry policy; sampai sini tetap 503)
+      return new ApiError('DB_UNAVAILABLE', 'Query terlalu lama diproses / terkunci, silakan coba ulang');
     default:
       return new ApiError('INTERNAL_ERROR', message || 'Terjadi kesalahan internal');
   }

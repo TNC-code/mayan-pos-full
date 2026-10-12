@@ -3,9 +3,10 @@ import path from 'node:path';
 import cors from 'cors';
 import express, { type Express } from 'express';
 import swaggerUi from 'swagger-ui-express';
+import { QueryTypes } from 'sequelize';
 import YAML from 'yaml';
 import { env } from './config/env.js';
-import { pool } from './config/db.js';
+import { sequelize } from './db/sequelize.js';
 import { buildRouter } from './routes/index.js';
 import { errorHandler, notFoundHandler } from './middleware/error-handler.js';
 import { rateLimit } from './middleware/rate-limit.js';
@@ -81,19 +82,32 @@ export function createApp(): Express {
   // P1: rate limit global (longgar; login/refresh punya limit ketat di router).
   app.use(rateLimit('global', { windowMs: 60_000, max: 600 }));
 
-  // Health check: ikut memverifikasi koneksi pool ke DB.
+  // Health check: ikut memverifikasi koneksi DB.
+  // MP-9: query lewat Sequelize (pool `pg` mentah sudah dihapus) — hasil dan
+  // bentuk response `{status, server_time_db, db{open_connections,max_connections}, uptime_sec}` tetap sama.
   app.get('/health', async (_req, res) => {
     try {
-      const db = await pool.query<{ db_now: Date; open_connections: number; pool_total: number; pool_idle: number }>(
+      const db = (await sequelize.query<{
+        db_now: Date;
+        open_connections: number;
+        pool_total: number;
+        pool_idle: number;
+      }>(
         `SELECT now() AS db_now,
                 (SELECT count(*)::int FROM pg_stat_activity WHERE datname = current_database()) AS open_connections,
                 (SELECT count(*)::int FROM pg_stat_activity WHERE datname = current_database() AND state = 'idle') AS pool_idle,
                 current_setting('max_connections')::int AS pool_total`,
-      );
+        { type: QueryTypes.SELECT },
+      )) as unknown as Array<{
+        db_now: Date;
+        open_connections: number;
+        pool_total: number;
+        pool_idle: number;
+      }>;
       res.json({
         status: 'ok',
-        server_time_db: db.rows[0]?.db_now.toISOString(),
-        db: { open_connections: db.rows[0]?.open_connections, max_connections: db.rows[0]?.pool_total },
+        server_time_db: new Date(db[0]!.db_now).toISOString(),
+        db: { open_connections: db[0]!.open_connections, max_connections: db[0]!.pool_total },
         uptime_sec: Math.round(process.uptime()),
       });
     } catch (err) {

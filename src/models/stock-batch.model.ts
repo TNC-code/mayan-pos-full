@@ -6,8 +6,8 @@ import { ApiError } from '../utils/errors.js';
  *
  * Catatan kontrak angka & tipe (parity dengan jalur raw SQL lama):
  *  - `id` bigserial + parser int8 global di `src/db/sequelize.ts` -> `number`
- *    (bukan string), sama seperti `pool.query` lama yang memasang
- *    `types.setTypeParser(20, …)` di `src/config/db.ts`.
+ *    (bukan string);MP-9: itu satu-satunya tempat parser-nya dipasang —
+ *    `src/config/db.ts` (pool `pg` mentah) sudah dihapus.
  *  - `qty_*` numeric(14,3) dan `unit_cost`/`markup_value` numeric(14,2)
  *    dikembalikan NUMBER oleh parser numeric -> response FE tidak bergeser.
  *  - `expired_date` kolom `date`: ditulis apa adanya sebagai string `YYYY-MM-DD`

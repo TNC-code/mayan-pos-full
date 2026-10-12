@@ -35,7 +35,8 @@ import { nextDocNo } from './docno.js';
  *   status : PENDING -> PROCESSING, PENDING/PROCESSING -> CANCELLED (alasan
  *            ditempel ke `note` dengan pemisah ' | '), CANCELLED final.
  *   convert: DONE hanya lewat `/convert` yang mengaitkan `sale_id` penjualan
- *            `COMPLETED`; CANCELLED ditolak, konversi ulang ke sale yang sama
+ *            `COMPLETED`; CANCELLED ditolak, satu penjualan tidak boleh menutup
+ *            dua order book (MP-9), konversi ulang ke sale yang sama
  *            = replay idempotent (200 + `X-Idempotent-Replay`).
  *
  * TIGA hal yang TIDAK digeser (catatan di bawah):
@@ -628,6 +629,9 @@ export async function setOrderBookStatus(
  *  - order tidak boleh CANCELLED (`409 ORDER_STATUS_TRANSITION`)
  *  - penjualan harus ada & `status = 'COMPLETED'` (VOIDED/RETURNED/sale lain
  *    tidak bisa jadi bukti order) -> `422 ORDER_CONVERT_INVALID`
+ *  - penjualan itu sudah menutup order book DONE lain -> `409 ORDER_ALREADY_DONE`
+ *    (MP-9: satu penjualan hanya boleh menutup satu order; penjaga DB-nya partial
+ *    unique index `uq_order_books_sale_id`, pesan di sini yang sampai ke kasir)
  *  - sudah DONE dengan sale yang sama -> 200 tanpa perubahan (aman bila FE retry)
  *  - sudah DONE dengan sale lain -> `409 ORDER_ALREADY_DONE`
  */
@@ -659,6 +663,23 @@ export async function convertOrderBook(
         throw new ApiError(
           'ORDER_CONVERT_INVALID',
           `Penjualan id=${saleId} berstatus ${sale.status}; hanya penjualan COMPLETED yang bisa dipakai`,
+        );
+      }
+
+      // MP-9: penjualan yang sama tidak boleh jadi bukti order book lain (satu
+      // penjualan = satu order). Dicek di sini supaya kasir dapat 409 + pesan
+      // jelas; partial unique index `uq_order_books_sale_id` tetap menutup
+      // race dua kasir yang mengonversi bersamaan.
+      const usedBy = await OrderBook.findOne({
+        where: { sale_id: saleId, status: 'DONE', id: { [Op.ne]: orderId } },
+        attributes: ['id', 'order_no'],
+        transaction,
+      });
+      if (usedBy) {
+        throw new ApiError(
+          'ORDER_ALREADY_DONE',
+          `Penjualan #${saleId} sudah dipakai order book ${usedBy.order_no}; ` +
+            'satu penjualan hanya bisa menutup satu order book',
         );
       }
 

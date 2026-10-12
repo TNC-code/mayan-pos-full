@@ -1,4 +1,4 @@
-import { closePool, pool } from '../src/config/db.js';
+import { closeDb, query as sql } from './db.js';
 import { env } from '../src/config/env.js';
 
 /**
@@ -44,7 +44,7 @@ const SUPPLIER_RETURN_TEST_PREDICATE = `(p.is_active = false OR p.sku ILIKE 'TES
  * Dilaporkan per return_no supaya hasilnya bisa diaudit.
  */
 async function markSupplierReturns(): Promise<number> {
-  const res = await pool.query<{ id: number; return_no: string; supplier_name: string; status: string; amount: string | null }>(
+  const res = await sql<{ id: number; return_no: string; supplier_name: string; status: string; amount: string | null }>(
     `UPDATE supplier_returns r SET is_test = true
       WHERE r.is_test = false
         AND (
@@ -70,7 +70,7 @@ async function markSupplierReturns(): Promise<number> {
 
 /** Opex write-off uji yang terdeteksi lewat produk uji di balik retur distributor. */
 async function markOpexFromTestSupplierReturns(): Promise<number> {
-  const res = await pool.query<{ id: number; amount: string; return_no: string }>(
+  const res = await sql<{ id: number; amount: string; return_no: string }>(
     `UPDATE operational_expenses e SET is_test = true
       WHERE e.is_test = false
         AND e.source = 'SUPPLIER_RETURN'
@@ -93,7 +93,7 @@ async function markOpexFromTestSupplierReturns(): Promise<number> {
 
 /** Fallback konservatif: opex write-off yang dibuat hari ini (tidak ada jejak produk uji). */
 async function markOpexWriteOffToday(): Promise<number> {
-  const res = await pool.query<{ id: number; amount: string; created_at: string }>(
+  const res = await sql<{ id: number; amount: string; created_at: string }>(
     `UPDATE operational_expenses e SET is_test = true
       WHERE e.is_test = false
         AND e.source = 'SUPPLIER_RETURN'
@@ -114,7 +114,7 @@ async function markOpexWriteOffToday(): Promise<number> {
  * diawali TEST, jadi aturannya sempit dan deterministik.
  */
 async function markManualTestExpenses(): Promise<number> {
-  const res = await pool.query<{ id: number; amount: string; category: string }>(
+  const res = await sql<{ id: number; amount: string; category: string }>(
     `UPDATE operational_expenses e SET is_test = true
       WHERE e.is_test = false
         AND e.source = 'MANUAL'
@@ -128,7 +128,7 @@ async function markManualTestExpenses(): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  const res = await pool.query(
+  const res = await sql(
     `UPDATE sales SET is_test = true
       WHERE is_test = false
         AND id <> ALL($1::int[])
@@ -154,10 +154,10 @@ async function main(): Promise<void> {
   const nManual = await markManualTestExpenses();
   console.log(`[mark-test-data] ${nManual} opex manual ditandai is_test=true (kategori berprefiks TEST)`);
 
-  const remaining = await pool.query<{ n: number }>(`SELECT COUNT(*)::int AS n FROM sales WHERE is_test = false`);
+  const remaining = await sql<{ n: number }>(`SELECT COUNT(*)::int AS n FROM sales WHERE is_test = false`);
   console.log(`[mark-test-data] sale produksi tersisa: ${remaining.rows[0]?.n ?? 0}`);
 
-  const opexLeft = await pool.query<{ n: number; total: string }>(
+  const opexLeft = await sql<{ n: number; total: string }>(
     `SELECT COUNT(*)::int AS n, COALESCE(SUM(amount), 0)::numeric(14,2) AS total
        FROM operational_expenses WHERE is_test = false`,
   );
@@ -165,7 +165,7 @@ async function main(): Promise<void> {
     `[mark-test-data] opex produksi tersisa: ${opexLeft.rows[0]?.n ?? 0} baris (Rp${opexLeft.rows[0]?.total ?? 0})`,
   );
 
-  const returLeft = await pool.query<{ n: number; total: string | null }>(
+  const returLeft = await sql<{ n: number; total: string | null }>(
     `SELECT COUNT(*)::int AS n, COALESCE(SUM(refunded_amount), 0)::numeric(14,2) AS total
        FROM supplier_returns WHERE is_test = false`,
   );
@@ -179,4 +179,4 @@ main()
     console.error('[mark-test-data] GAGAL:', err);
     process.exitCode = 1;
   })
-  .finally(() => closePool());
+  .finally(() => closeDb());

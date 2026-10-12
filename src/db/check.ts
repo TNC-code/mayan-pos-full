@@ -1,5 +1,6 @@
-import { QueryTypes } from 'sequelize';
+import { Op, QueryTypes } from 'sequelize';
 import { env } from '../config/env.js';
+import { Product } from '../models/index.js';
 import { sequelize } from './sequelize.js';
 
 /**
@@ -75,6 +76,47 @@ export interface SchemaCheck {
   missingSequences: string[];
   missingEntitlementColumns: string[];
   hasStoreRow: boolean;
+}
+
+/* ================================================================== *
+ * Anti-drift parser numeric (MP-9.2)
+ * ================================================================== */
+
+/**
+ * Kontrak angka: `openapi.yaml` mendeklarasikan uang/qty sebagai `type: number`.
+ * Driver `pg` mengirim `numeric`/`bigint` sebagai string; angka dirantai lewat
+ * `types.setTypeParser` + `oidParserMap` Sequelize (lihat `db/sequelize.ts`).
+ *
+ * Kalau rantai itu lapsus di masa depan (upgrade Sequelize), angka kembali jadi
+ * string dan TIDAK apa-apanya crash — response tetap 200 tapi kas tampil
+ * `"12500"`. Karena itu test ini wajib ada. Satu query model (bukan
+ * `sequelize.query`) supaya assertion-nya persis menutup jalur yang dipakai
+ * endpoint (`Product.findOne`).
+ */
+export interface NumericContractCheck {
+  ok: boolean;
+  /** `typeof` yang diamati, mis. `'number'` (diharapkan) atau `'string'` (drift). */
+  observed: string;
+  /** Nilai contoh yang dibaca (berguna saat assertion gagal). */
+  sample: number | string | null;
+  /** True saat tidak ada produk ber-`harga_beli` -> tidak ada yang bisa diperiksa. */
+  skipped: boolean;
+}
+
+export async function verifyNumericContract(): Promise<NumericContractCheck> {
+  const row = await Product.scope('withInactive').findOne({
+    where: { harga_beli: { [Op.ne]: null } },
+    attributes: ['id', 'harga_beli'],
+    order: [['id', 'ASC']],
+  });
+
+  if (!row || row.harga_beli === null || row.harga_beli === undefined) {
+    // DB belum punya harga beli sama sekali -> tidak ada bukti parsir, jangan dianggap gagal.
+    return { ok: true, observed: 'n/a', sample: null, skipped: true };
+  }
+
+  const observed = typeof row.harga_beli;
+  return { ok: observed === 'number', observed, sample: row.harga_beli, skipped: false };
 }
 
 export async function verifySchema(): Promise<SchemaCheck> {
@@ -196,6 +238,21 @@ async function main(): Promise<void> {
   )) as unknown as Array<{ label: string; n: number }>;
   console.log('── isi tabel ──');
   for (const c of counts) console.log(`  ${c.label.padEnd(16)}: ${c.n}`);
+
+  // Kontrak angka (anti-drift upgrade Sequelize): harus `number`, bukan `string`.
+  const numeric = await verifyNumericContract();
+  if (numeric.skipped) {
+    console.log('── parser numeric ──');
+    console.log(' lewati: belum ada produk dengan harga_beli (tidak ada yang bisa diperiksa)');
+  } else if (numeric.ok) {
+    console.log('── parser numeric ──');
+    console.log(` OK: typeof(harga_beli) = ${numeric.observed} (kontrak openapi: number)`);
+  } else {
+    console.log('── parser numeric ──');
+    console.log(` GAGAL: typeof(harga_beli) = ${numeric.observed}, contoh ${JSON.stringify(numeric.sample)}`);
+    console.log(' Periksa patch oidParserMap di src/db/sequelize.ts (numeric/int8 -> Number)');
+    process.exitCode = 1;
+  }
 }
 
 if (require.main === module) {
