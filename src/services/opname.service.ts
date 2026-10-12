@@ -1,12 +1,44 @@
-import type { PoolClient } from 'pg';
-import { pool } from '../config/db.js';
+import { Op, QueryTypes, type Transaction } from 'sequelize';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/errors.js';
-import { round2, round3, withTx } from '../utils/tx.js';
+import { round2, round3, withOrmTx } from '../utils/tx.js';
+import { mapOrmError } from '../utils/orm-errors.js';
+import { isoDateOnly } from '../utils/dates.js';
+import {
+  Product,
+  StockBatch,
+  StockMovement,
+  StockOpname,
+  StockOpnameItem,
+  sequelize,
+  type OpnameCause,
+} from '../models/index.js';
 import { nextDocNo } from './docno.js';
 
-/** Penyebab selisih opname (lihat constraint chk_opname_item_cause). */
-export type OpnameCause = 'RUSAK' | 'HILANG' | 'SALAH_HITUNG' | 'LAIN';
+/**
+ * Opname stok di atas Sequelize (MP-5).
+ *
+ * Dua jalur yang disengaja (hybrid §D4, sama seperti `stock.service.ts`):
+ *  - TULIS (`createOpname`) murni model + `withOrmTx`:
+ *      header -> item per baris (snapshot sistem) -> movement ADJUSTMENT GOOD/RUSAK;
+ *    semua koreksi stok diteruskan ke trigger `trg_stock_movement_apply`, service
+ *    tidak pernah menulis `qty_remaining`/`qty_damaged` langsung.
+ *  - BACA daftar/detail lewat `sequelize.query` dengan SQL yang disalin PERSIS
+ *    dari versi lama, karena agregatnya berantai lintas-tabel
+ *    (`total_value_difference` = Σ (difference + damaged_difference) × harga beli
+ *    acuan, di mana harga acuan = `unit_cost` batch atau rata-rata tertimbang
+ *    batch produk) — jauh lebih ringkas & teruji daripada builder ORM, dan
+ *    bentuk response FE harus tidak bergeser. Nilai filter tetap di-bind.
+ *
+ * Kolom `difference` & `damaged_difference` adalah GENERATED column DB -> hanya
+ * dibaca, tidak pernah ditulis (lihat stock-opname-item.model.ts).
+ *
+ * Kunci baris `FOR UPDATE` dipakai persis seperti versi lama: baris batch
+ * tujuan dikunci sebelum snapshot/koreksi, sehingga dua opname paralel untuk
+ * produk yang sama tidak bisa menghitung selisih dari snapshot yang sama.
+ */
+
+export type { OpnameCause };
 
 export interface OpnameItemRow {
   id: number;
@@ -53,6 +85,18 @@ export interface OpnameRow {
   total_gain_value?: number;
 }
 
+export interface OpnameDetail extends OpnameRow {
+  items: OpnameItemRow[];
+}
+
+/* ============================== SQL baca (hybrid) ============================== */
+
+/** Baris mentah dari query agregat (kolom tanggal masih bentuk DB). */
+type RawOpnameRow = Omit<OpnameRow, 'opname_date' | 'created_at'> & {
+  opname_date: string | Date;
+  created_at: string | Date;
+};
+
 const SELECT_OPNAME = `
   SELECT o.id, o.opname_no, o.opname_date, o.note, o.created_by, u.username AS created_by_name, o.created_at,
          (SELECT count(*)::int FROM stock_opname_items i WHERE i.opname_id = o.id) AS item_count,
@@ -96,45 +140,83 @@ const SELECT_ITEM = `
     LEFT JOIN stock_batches b ON b.id = i.batch_id
 `;
 
-export async function listOpnames(params: { date?: string; limit: number; offset: number }): Promise<OpnameRow[]> {
-  const args: unknown[] = [];
+/** `timestamptz` -> ISO; kolom `date` -> ISO lewat helper yang sama bentuk wire-nya. */
+function isoTs(value: string | Date): string {
+  return new Date(value).toISOString();
+}
+
+/** Normalisasi baris agregat + total rugi/lebih (parity `rowsWithTotals` versi lama). */
+function toOpnameRow(row: RawOpnameRow): OpnameRow {
+  const total = Number(row.total_value_difference ?? 0);
+  return {
+    id: row.id,
+    opname_no: row.opname_no,
+    opname_date: isoDateOnly(row.opname_date) as string,
+    note: row.note,
+    created_by: row.created_by,
+    created_by_name: row.created_by_name,
+    created_at: isoTs(row.created_at),
+    item_count: row.item_count,
+    total_difference: row.total_difference,
+    total_difference_damaged: row.total_difference_damaged,
+    total_value_difference: row.total_value_difference,
+    total_loss_value: total < 0 ? round2(Math.abs(total)) : 0,
+    total_gain_value: total > 0 ? round2(total) : 0,
+  };
+}
+
+/* ============================== daftar opname ============================== */
+
+export interface OpnameListQuery {
+  date?: string;
+  limit: number;
+  offset: number;
+}
+
+/** `GET /opnames` — riwayat opname (default `id DESC`) + agregat selisih per opname. */
+export async function listOpnames(params: OpnameListQuery): Promise<OpnameRow[]> {
+  const binds: unknown[] = [];
   const where: string[] = [];
-  if (params.date) {
-    args.push(params.date);
-    where.push(`o.opname_date = $${args.length}::date`);
-  }
-  args.push(params.limit, params.offset);
-  const res = await pool.query<OpnameRow>(
+  const push = (value: unknown): string => {
+    binds.push(value);
+    return `$${binds.length}`;
+  };
+
+  if (params.date) where.push(`o.opname_date = ${push(params.date)}::date`);
+
+  const limitIdx = binds.push(params.limit);
+  const offsetIdx = binds.push(params.offset);
+
+  const rows = (await sequelize.query(
     `${SELECT_OPNAME} ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
-     ORDER BY o.id DESC LIMIT $${args.length - 1} OFFSET $${args.length}`,
-    args as never[],
-  );
-  return rowsWithTotals(res.rows);
+     ORDER BY o.id DESC LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    { bind: binds, type: QueryTypes.SELECT },
+  )) as RawOpnameRow[];
+
+  return rows.map(toOpnameRow);
 }
 
-export async function getOpname(
-  id: number,
-  client: PoolClient | null = null,
-): Promise<OpnameRow & { items: OpnameItemRow[] }> {
-  const runner = client ? client.query.bind(client) : pool.query.bind(pool);
-  const head = await runner(`${SELECT_OPNAME} WHERE o.id = $1`, [id]);
-  if (!head.rows[0]) throw new ApiError('NOT_FOUND', `Opname id=${id} tidak ditemukan`);
-  const items = await runner(`${SELECT_ITEM} WHERE i.opname_id = $1 ORDER BY i.id ASC`, [id]);
-  const [detail] = rowsWithTotals([head.rows[0] as OpnameRow]);
-  return { ...detail, items: items.rows as OpnameItemRow[] };
+/* ============================== detail opname ============================== */
+
+/** `GET /opnames/:id` — boleh dipanggil dalam transaksi (langsung setelah create). */
+export async function getOpname(id: number, transaction?: Transaction): Promise<OpnameDetail> {
+  const head = (await sequelize.query(`${SELECT_OPNAME} WHERE o.id = $id`, {
+    bind: { id },
+    type: QueryTypes.SELECT,
+    transaction,
+  })) as RawOpnameRow[];
+  if (!head[0]) throw new ApiError('NOT_FOUND', `Opname id=${id} tidak ditemukan`);
+
+  const items = (await sequelize.query(`${SELECT_ITEM} WHERE i.opname_id = $id ORDER BY i.id ASC`, {
+    bind: { id },
+    type: QueryTypes.SELECT,
+    transaction,
+  })) as OpnameItemRow[];
+
+  return { ...toOpnameRow(head[0]), items };
 }
 
-/** Tambahkan total rugi/lebih (Rp) yang tidak bisa diringkas di SQL aggregate. */
-function rowsWithTotals(rows: OpnameRow[]): OpnameRow[] {
-  return rows.map((r) => {
-    const total = Number(r.total_value_difference ?? 0);
-    return {
-      ...r,
-      total_loss_value: total < 0 ? round2(Math.abs(total)) : 0,
-      total_gain_value: total > 0 ? round2(total) : 0,
-    };
-  });
-}
+/* ============================== tulis opname ============================== */
 
 export interface OpnameInputItem {
   product_id: number;
@@ -159,37 +241,54 @@ interface SystemSnapshot {
 }
 
 async function readSystemSnapshot(
-  client: PoolClient,
+  transaction: Transaction,
   productId: number,
   batchId: number | null,
   lock: boolean,
 ): Promise<SystemSnapshot> {
   if (batchId) {
-    const b = await client.query<{ qty_remaining: string; qty_damaged: string }>(
-      `SELECT qty_remaining, qty_damaged FROM stock_batches WHERE id = $1 AND product_id = $2${lock ? ' FOR UPDATE' : ''}`,
-      [batchId, productId],
-    );
-    if (!b.rows[0]) {
+    // `lock` di sini selalu true dari createOpname (satu-satunya pemanggil).
+    const batch = await StockBatch.findOne({
+      where: { id: batchId, product_id: productId },
+      transaction,
+      ...(lock ? { lock: transaction.LOCK.UPDATE } : {}),
+    });
+    if (!batch) {
       throw new ApiError('BATCH_NOT_FOUND', `Batch id=${batchId} bukan batch dari produk id=${productId}`);
     }
     return {
       batch_id: batchId,
-      system_qty: Number(b.rows[0].qty_remaining),
-      system_qty_damaged: Number(b.rows[0].qty_damaged),
+      system_qty: batch.qty_remaining,
+      system_qty_damaged: batch.qty_damaged,
     };
   }
 
-  const s = await client.query<{ good: string; damaged: string }>(
-    `SELECT COALESCE(sum(qty_remaining), 0)::numeric(14,3) AS good,
-            COALESCE(sum(qty_damaged), 0)::numeric(14,3) AS damaged
-       FROM stock_batches WHERE product_id = $1`,
-    [productId],
-  );
+  // Tanpa batch -> agregat seluruh batch produk (snapshotted per produk, bukan per batch).
+  const good = await StockBatch.sum('qty_remaining', { where: { product_id: productId }, transaction });
+  const damaged = await StockBatch.sum('qty_damaged', { where: { product_id: productId }, transaction });
   return {
     batch_id: null,
-    system_qty: Number(s.rows[0]?.good ?? 0),
-    system_qty_damaged: Number(s.rows[0]?.damaged ?? 0),
+    system_qty: Number(good ?? 0),
+    system_qty_damaged: Number(damaged ?? 0),
   };
+}
+
+/**
+ * Batch tujuan koreksi. `forRemoval` (selisih negatif barang rusak) hanya memilih batch
+ * yang benar-benar punya barang rusak, supaya tidak rely on pesan error trigger.
+ */
+async function pickAdjustmentBatch(
+  transaction: Transaction,
+  productId: number,
+  forRemoval: boolean,
+): Promise<number | null> {
+  const batch = await StockBatch.findOne({
+    where: { product_id: productId, ...(forRemoval ? { qty_damaged: { [Op.gt]: 0 } } : {}) },
+    // expired_date NULLS LAST adalah default PostgreSQL untuk ASC.
+    order: [['expired_date', 'ASC'], ['id', 'ASC']],
+    transaction,
+  });
+  return batch?.id ?? null;
 }
 
 /**
@@ -205,10 +304,10 @@ async function readSystemSnapshot(
  * GOOD hanya bisa dikoreksi bila masih berada di dalam kapasitas batch (dicek di sini agar
  * pesannya jelas, bukan error CHECK mentah). qty_damaged tidak punya batas kapasitas.
  */
-export async function createOpname(
-  input: OpnameInput,
-  userId: number,
-): Promise<OpnameRow & { items: OpnameItemRow[] }> {
+export async function createOpname(input: OpnameInput, userId: number): Promise<OpnameDetail> {
+  // Satu produk hanya boleh satu baris per opname (constraint DB hanya unik per
+  // (opname_id, product_id, batch_id) — validasi aplikasi dibuat lebih ketat
+  // supaya kasir tidak salah input dobel tanpa sadar).
   const seen = new Set<number>();
   for (const it of input.items) {
     if (seen.has(it.product_id)) {
@@ -217,145 +316,129 @@ export async function createOpname(
     seen.add(it.product_id);
   }
 
-  return withTx(async (client) => {
-    const opnameNo = await nextDocNo(client, 'opname', env.businessTz);
-    const head = await client.query<{ id: number }>(
-      `INSERT INTO stock_opnames (opname_no, note, created_by) VALUES ($1, $2, $3) RETURNING id`,
-      [opnameNo, input.note ?? null, userId],
-    );
-    const opnameId = head.rows[0]!.id;
-
-    for (const item of input.items) {
-      const product = await client.query<{ id: number; name: string }>(`SELECT id, name FROM product WHERE id = $1`, [
-        item.product_id,
-      ]);
-      if (!product.rows[0]) {
-        throw new ApiError('VALIDATION_ERROR', `Produk id=${item.product_id} tidak ditemukan`);
-      }
-
-      // Snapshot sistem: GOOD (qty_remaining) + RUSAK (qty_damaged), opsional per batch.
-      const sys = await readSystemSnapshot(client, item.product_id, item.batch_id ?? null, true);
-      const physicalDamaged =
-        item.physical_qty_damaged === undefined || item.physical_qty_damaged === null
-          ? sys.system_qty_damaged
-          : item.physical_qty_damaged;
-
-      const diff = round3(item.physical_qty - sys.system_qty);
-      const damagedDiff = round3(physicalDamaged - sys.system_qty_damaged);
-
-      await client.query(
-        `INSERT INTO stock_opname_items
-           (opname_id, product_id, batch_id, system_qty, physical_qty, system_qty_damaged, physical_qty_damaged, cause, note)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [
-          opnameId,
-          item.product_id,
-          sys.batch_id,
-          sys.system_qty,
-          item.physical_qty,
-          sys.system_qty_damaged,
-          physicalDamaged,
-          item.cause ?? null,
-          item.note ?? null,
-        ],
+  try {
+    return await withOrmTx(async (transaction) => {
+      const opnameNo = await nextDocNo(transaction, 'opname', env.businessTz);
+      const opname = await StockOpname.create(
+        { opname_no: opnameNo, note: input.note ?? null, created_by: userId },
+        { transaction },
       );
 
-      if (diff !== 0) {
-        const target = sys.batch_id ?? (await pickAdjustmentBatch(client, item.product_id, false));
-        if (target === null) {
-          throw new ApiError(
-            'VALIDATION_ERROR',
-            `Selisih opname produk "${product.rows[0].name}" tidak dapat dikoreksi: belum ada batch stok`,
-          );
+      for (const item of input.items) {
+        const product = await Product.scope('withInactive').findByPk(item.product_id, {
+          attributes: ['id', 'name'],
+          transaction,
+        });
+        if (!product) {
+          throw new ApiError('VALIDATION_ERROR', `Produk id=${item.product_id} tidak ditemukan`);
         }
-        const cap = await client.query<{ qty_received: string; qty_remaining: string; unit_cost: string }>(
-          `SELECT qty_received, qty_remaining, unit_cost FROM stock_batches WHERE id = $1 FOR UPDATE`,
-          [target],
+
+        // Snapshot sistem: GOOD (qty_remaining) + RUSAK (qty_damaged), opsional per batch.
+        const sys = await readSystemSnapshot(transaction, item.product_id, item.batch_id ?? null, true);
+        const physicalDamaged =
+          item.physical_qty_damaged === undefined || item.physical_qty_damaged === null
+            ? sys.system_qty_damaged
+            : item.physical_qty_damaged;
+
+        const diff = round3(item.physical_qty - sys.system_qty);
+        const damagedDiff = round3(physicalDamaged - sys.system_qty_damaged);
+
+        await StockOpnameItem.create(
+          {
+            opname_id: opname.id,
+            product_id: item.product_id,
+            batch_id: sys.batch_id,
+            system_qty: sys.system_qty,
+            physical_qty: item.physical_qty,
+            system_qty_damaged: sys.system_qty_damaged,
+            physical_qty_damaged: physicalDamaged,
+            cause: item.cause ?? null,
+            note: item.note ?? null,
+          },
+          { transaction },
         );
-        const row = cap.rows[0]!;
-        if (diff > 0 && Number(row.qty_remaining) + diff > Number(row.qty_received)) {
-          throw new ApiError(
-            'VALIDATION_ERROR',
-            `Selisih opname +${diff} melebihi kapasitas batch (sisa ${row.qty_remaining} / diterima ${row.qty_received}). ` +
-              `Buat batch pembelian baru untuk mencatat kelebihan stok.`,
+
+        if (diff !== 0) {
+          const target = sys.batch_id ?? (await pickAdjustmentBatch(transaction, item.product_id, false));
+          if (target === null) {
+            throw new ApiError(
+              'VALIDATION_ERROR',
+              `Selisih opname produk "${product.name}" tidak dapat dikoreksi: belum ada batch stok`,
+            );
+          }
+          const cap = await StockBatch.findByPk(target, { transaction, lock: transaction.LOCK.UPDATE });
+          if (!cap) {
+            throw new ApiError('VALIDATION_ERROR', `Batch id=${target} tidak ditemukan saat koreksi opname`);
+          }
+          if (diff > 0 && cap.qty_remaining + diff > cap.qty_received) {
+            throw new ApiError(
+              'VALIDATION_ERROR',
+              `Selisih opname +${diff} melebihi kapasitas batch (sisa ${cap.qty_remaining} / diterima ${cap.qty_received}). ` +
+                `Buat batch pembelian baru untuk mencatat kelebihan stok.`,
+            );
+          }
+
+          await StockMovement.create(
+            {
+              product_id: item.product_id,
+              batch_id: target,
+              movement_type: 'ADJUSTMENT',
+              qty_change: diff,
+              unit_cost: cap.qty_remaining > 0 ? cap.unit_cost : 0,
+              reference_type: 'OPNAME',
+              reference_id: opname.id,
+              note: `Koreksi opname ${opnameNo}: system ${sys.system_qty} -> fisik ${item.physical_qty}`,
+              created_by: userId,
+              condition: 'GOOD',
+            },
+            { transaction },
           );
         }
 
-        await client.query(
-          `INSERT INTO stock_movements
-             (product_id, batch_id, movement_type, qty_change, unit_cost, reference_type, reference_id, note, created_by, condition)
-           VALUES ($1, $2, 'ADJUSTMENT', $3, $4, 'OPNAME', $5, $6, $7, 'GOOD')`,
-          [
-            item.product_id,
-            target,
-            diff,
-            Number(row.qty_remaining) > 0 ? Number(row.unit_cost) : 0,
-            opnameId,
-            `Koreksi opname ${opnameNo}: system ${sys.system_qty} -> fisik ${item.physical_qty}`,
-            userId,
-          ],
-        );
+        if (damagedDiff !== 0) {
+          // Barang rusak tidak ikut kapasitas batch; trigger yang menjaga qty_damaged >= 0.
+          const target =
+            sys.batch_id ?? (await pickAdjustmentBatch(transaction, item.product_id, damagedDiff < 0));
+          if (target === null) {
+            throw new ApiError(
+              'VALIDATION_ERROR',
+              `Selisih opname barang rusak produk "${product.name}" tidak dapat dikoreksi: belum ada batch stok`,
+            );
+          }
+          const cap = await StockBatch.findByPk(target, { transaction, lock: transaction.LOCK.UPDATE });
+          if (!cap) {
+            throw new ApiError('VALIDATION_ERROR', `Batch id=${target} tidak ditemukan saat koreksi opname rusak`);
+          }
+          if (damagedDiff < 0 && cap.qty_damaged + damagedDiff < 0) {
+            throw new ApiError(
+              'DAMAGED_QTY_INSUFFICIENT',
+              `Selisih opname barang rusak ${damagedDiff} melebihi stok rusak yang tercatat pada batch #${target} (${cap.qty_damaged})`,
+            );
+          }
+
+          await StockMovement.create(
+            {
+              product_id: item.product_id,
+              batch_id: target,
+              movement_type: 'ADJUSTMENT',
+              qty_change: damagedDiff,
+              unit_cost: cap.unit_cost,
+              reference_type: 'OPNAME',
+              reference_id: opname.id,
+              note:
+                `Koreksi opname ${opnameNo} (barang rusak): system ${sys.system_qty_damaged} -> fisik ${physicalDamaged}` +
+                (item.cause ? ` [${item.cause}]` : ''),
+              created_by: userId,
+              condition: 'RUSAK',
+            },
+            { transaction },
+          );
+        }
       }
 
-      if (damagedDiff !== 0) {
-        // Barang rusak tidak ikut kapasitas batch; trigger yang menjaga qty_damaged >= 0.
-        const target =
-          sys.batch_id ??
-          (await pickAdjustmentBatch(client, item.product_id, damagedDiff < 0));
-        if (target === null) {
-          throw new ApiError(
-            'VALIDATION_ERROR',
-            `Selisih opname barang rusak produk "${product.rows[0].name}" tidak dapat dikoreksi: belum ada batch stok`,
-          );
-        }
-        const cap = await client.query<{ qty_damaged: string; unit_cost: string }>(
-          `SELECT qty_damaged, unit_cost FROM stock_batches WHERE id = $1 FOR UPDATE`,
-          [target],
-        );
-        const row = cap.rows[0]!;
-        if (damagedDiff < 0 && Number(row.qty_damaged) + damagedDiff < 0) {
-          throw new ApiError(
-            'DAMAGED_QTY_INSUFFICIENT',
-            `Selisih opname barang rusak ${damagedDiff} melebihi stok rusak yang tercatat pada batch #${target} (${row.qty_damaged})`,
-          );
-        }
-
-        await client.query(
-          `INSERT INTO stock_movements
-             (product_id, batch_id, movement_type, qty_change, unit_cost, reference_type, reference_id, note, created_by, condition)
-           VALUES ($1, $2, 'ADJUSTMENT', $3, $4, 'OPNAME', $5, $6, $7, 'RUSAK')`,
-          [
-            item.product_id,
-            target,
-            damagedDiff,
-            Number(row.unit_cost),
-            opnameId,
-            `Koreksi opname ${opnameNo} (barang rusak): system ${sys.system_qty_damaged} -> fisik ${physicalDamaged}` +
-              (item.cause ? ` [${item.cause}]` : ''),
-            userId,
-          ],
-        );
-      }
-    }
-
-    return getOpname(opnameId, client);
-  }, 'opname');
-}
-
-/**
- * Batch tujuan koreksi. `forRemoval` (selisih negatif barang rusak) hanya memilih batch
- * yang benar-benar punya barang rusak, supaya tidak rely on pesan error trigger.
- */
-async function pickAdjustmentBatch(
-  client: PoolClient,
-  productId: number,
-  forRemoval: boolean,
-): Promise<number | null> {
-  const res = await client.query<{ id: number }>(
-    `SELECT id FROM stock_batches
-      WHERE product_id = $1 ${forRemoval ? 'AND qty_damaged > 0' : ''}
-      ORDER BY expired_date ASC NULLS LAST, id ASC LIMIT 1`,
-    [productId],
-  );
-  return res.rows[0]?.id ?? null;
+      return getOpname(opname.id, transaction);
+    }, 'opname');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }

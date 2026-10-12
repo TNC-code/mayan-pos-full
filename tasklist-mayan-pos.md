@@ -5,7 +5,22 @@
 > DB target: `mayan_pos_dev` (fresh kosong) · Branch: `mayan_pos`
 
 ## Riwayat
-- (belum ada — mulai MP-1)
+- MP-1..MP-4 — selesai (HEAD 6412167).
+- MP-5 — selesai (shift kasir & opname di atas Sequelize):
+  - Model `cash-session` (timestamptz `opened_at`/`closed_at`, `timestamps:false`),
+    `stock-opname` (DATEONLY + `Sequelize.literal('CURRENT_DATE')`), `stock-opname-item`
+    (`difference`/`damaged_difference` GENERATED → setter menolak, pola `subtotal`).
+  - `cash-session.service` Sequelize penuh: open (guard sesi OPEN ganda → 409
+    `CONCURRENT_CONFLICT`), list (`user_id`/`status` + paging), get, close
+    (`expected = opening + Σ payment CASH − Σ refund CASH` sejak `opened_at`,
+    `difference = closing − expected`; `note` saat close tidak menimpa note open).
+  - `opname.service`: tulis 100% model + `withOrmTx` (snapshot sistem per batch
+    `FOR UPDATE`, movement ADJUSTMENT GOOD/RUSAK, guard kapasitas batch &
+    `DAMAGED_QTY_INSUFFICIENT`, `nextDocNo('opname')`); baca `listOpnames`/`getOpname`
+    tetap hybrid `sequelize.query` dengan SQL agregat versi lama (paritas nilai Rp).
+  - Smoke: siklus shift (expected 115000 / counted 114000 / selisih −1000), guard
+    buka-ganda & tutup-ganda 409, 2 kasir shift bersamaan, opname GOOD/RUSAK/kapasitas/
+    dobel/rollback utuh, ledger 62 batch 0 mismatch, RBAC 403/401.
 
 ---
 
@@ -137,16 +152,16 @@
 ## MP-5 — Shift Kasir & Opname (estimasi 3 hari)
 
 ### MP-5.1 Model
-- [ ] `cash-session.model.ts` (OPEN/CLOSED, opening/closing/expected/difference), `stock-opname.model.ts` + `stock-opname-item.model.ts` (physical/system good+damaged, difference generated, cause)
+- [x] `cash-session.model.ts` (OPEN/CLOSED, opening/closing/expected/difference), `stock-opname.model.ts` + `stock-opname-item.model.ts` (physical/system good+damaged, difference generated, cause)
 
 ### MP-5.2 Services
-- [ ] `cash-session.service.ts`: open (guard shift OPEN ganda per user), list/get, close (expected = opening + kas masuk − kas keluar − refund tercatat; `difference` otomatis)
-- [ ] `opname.service.ts`: createOpname dalam 1 transaksi — snapshot system_qty & system_qty_damaged per batch (`FOR UPDATE`), movement `ADJUSTMENT` GOOD/RUSAK (trigger mengarahkan ke kolom stok yang benar), simpan `cause` + `physical_*`; getOpname (detail + `value_difference` Rp); listOpnames (+total selisih Rp)
+- [x] `cash-session.service.ts`: open (guard shift OPEN ganda per user), list/get, close (expected = opening + kas masuk − kas keluar − refund tercatat; `difference` otomatis)
+- [x] `opname.service.ts`: createOpname dalam 1 transaksi — snapshot system_qty & system_qty_damaged per batch (`FOR UPDATE`), movement `ADJUSTMENT` GOOD/RUSAK (trigger mengarahkan ke kolom stok yang benar), simpan `cause` + `physical_*`; getOpname (detail + `value_difference` Rp); listOpnames (+total selisih Rp)
 
 ### MP-5.3 Verifikasi & acceptance MP-5
-- [ ] Siklus shift: open → jual tunai → close → difference benar; shift kedua user bersamaan diperbolehkan (user beda), user sama ditolak
-- [ ] Opname: barang hilang (cause HILANG) → movement ADJUSTMENT minus GOOD; barang rusak fisik → ADJUSTMENT RUSAK → `qty_damaged` naik; nilai rugi Rp terhitung di detail
-- [ ] Path `/cash-sessions*`, `/opnames*` sesuai openapi; RBAC mutasi KASIR
+- [x] Siklus shift: open → jual tunai → close → difference benar; shift kedua user bersamaan diperbolehkan (user beda), user sama ditolak
+- [x] Opname: barang hilang (cause HILANG) → movement ADJUSTMENT minus GOOD; barang rusak fisik → ADJUSTMENT RUSAK → `qty_damaged` naik; nilai rugi Rp terhitung di detail
+- [x] Path `/cash-sessions*`, `/opnames*` sesuai openapi; RBAC mutasi KASIR
 
 ---
 

@@ -16,6 +16,9 @@ import { initRefund, Refund } from './refund.model.js';
 import { initRefundItem, RefundItem } from './refund-item.model.js';
 import { initStoreProfile, StoreProfile } from './store-profile.model.js';
 import { initIdempotencyKey, IdempotencyKey } from './idempotency-key.model.js';
+import { initCashSession, CashSession } from './cash-session.model.js';
+import { initStockOpname, StockOpname } from './stock-opname.model.js';
+import { initStockOpnameItem, StockOpnameItem } from './stock-opname-item.model.js';
 
 /**
  * REGISTRY MODEL (plan §D4).
@@ -63,6 +66,9 @@ export function initModels(instance: Sequelize = sequelize): void {
   initRefundItem(instance);
   initStoreProfile(instance);
   initIdempotencyKey(instance);
+  initCashSession(instance);
+  initStockOpname(instance);
+  initStockOpnameItem(instance);
   initialized = true;
 }
 
@@ -143,6 +149,21 @@ export function associate(): void {
   RefundItem.belongsTo(Refund, { foreignKey: 'refund_id', as: 'refund' });
   RefundItem.belongsTo(SaleItem, { foreignKey: 'sale_item_id', as: 'sale_item' });
 
+  /* ---------------------- shift kasir & opname (MP-5) ----------------------
+   * `cash_sessions` hanya punya SATU FK ke user (`user_id` = kasir pemilik
+   * shift; tidak ada kolom opened_by/closed_by terpisah di baseline), jadi
+   * alias-nya `user` supaya tidak menabrak nama kolom `user_id` di dataValues.
+   * Opname: header -> items, dibuat oleh kasir (`created_by` -> `creator`,
+   * alias yang sama seperti batch/sale/movement di atas).
+   */
+  CashSession.belongsTo(UserAccount, { foreignKey: 'user_id', as: 'user' });
+
+  StockOpname.hasMany(StockOpnameItem, { foreignKey: 'opname_id', as: 'items' });
+  StockOpnameItem.belongsTo(StockOpname, { foreignKey: 'opname_id', as: 'opname' });
+  StockOpname.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+  StockOpnameItem.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
+  StockOpnameItem.belongsTo(StockBatch, { foreignKey: 'batch_id', as: 'batch' });
+
   associated = true;
 }
 
@@ -152,6 +173,7 @@ associate();
 
 export { sequelize };
 export {
+  CashSession,
   Customer,
   IdempotencyKey,
   Payment,
@@ -166,6 +188,8 @@ export {
   SaleItem,
   StockBatch,
   StockMovement,
+  StockOpname,
+  StockOpnameItem,
   StoreProfile,
   UserAccount,
 };
@@ -192,3 +216,10 @@ export type {
   MovementType,
   MovementCondition,
 } from './stock-movement.model.js';
+export type { CashSessionAttributes, CashSessionCreationAttributes, CashSessionStatus } from './cash-session.model.js';
+export type { StockOpnameAttributes, StockOpnameCreationAttributes } from './stock-opname.model.js';
+export type {
+  StockOpnameItemAttributes,
+  StockOpnameItemCreationAttributes,
+  OpnameCause,
+} from './stock-opname-item.model.js';
