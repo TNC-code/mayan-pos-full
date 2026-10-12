@@ -19,6 +19,9 @@ import { initIdempotencyKey, IdempotencyKey } from './idempotency-key.model.js';
 import { initCashSession, CashSession } from './cash-session.model.js';
 import { initStockOpname, StockOpname } from './stock-opname.model.js';
 import { initStockOpnameItem, StockOpnameItem } from './stock-opname-item.model.js';
+import { initSupplierReturn, SupplierReturn } from './supplier-return.model.js';
+import { initSupplierReturnItem, SupplierReturnItem } from './supplier-return-item.model.js';
+import { initOperationalExpense, OperationalExpense } from './operational-expense.model.js';
 
 /**
  * REGISTRY MODEL (plan §D4).
@@ -69,6 +72,9 @@ export function initModels(instance: Sequelize = sequelize): void {
   initCashSession(instance);
   initStockOpname(instance);
   initStockOpnameItem(instance);
+  initSupplierReturn(instance);
+  initSupplierReturnItem(instance);
+  initOperationalExpense(instance);
   initialized = true;
 }
 
@@ -164,6 +170,30 @@ export function associate(): void {
   StockOpnameItem.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
   StockOpnameItem.belongsTo(StockBatch, { foreignKey: 'batch_id', as: 'batch' });
 
+  /* ------------------- retur distributor & opex (MP-6) -------------------
+   * Alias association memakai nama BEDA dari kolom FK-nya, supaya tidak
+   * menabrak `dataValues` (pola yang sama seperti batch/sale/opname di atas):
+   *   `created_by` -> `creator`, `settled_by` -> `settledBy`,
+   *   `refunded_method_id` -> `refundedMethod`.
+   *
+   * PENTING saat include `SupplierReturn.refundedMethod` dan
+   * `SupplierReturnItem.product`: keduanya punya default scope
+   * `is_active = true` sedangkan JOIN lama TIDAK memfilternya -> riwayat retur
+   * dari metode/produk yang lalu dinonaktifkan tetap harus terbaca, jadi include
+   * wajib lewat `.scope('withInactive')` (pola yang sama dengan `sale.service.ts`).
+   */
+  SupplierReturn.hasMany(SupplierReturnItem, { foreignKey: 'return_id', as: 'items' });
+  SupplierReturnItem.belongsTo(SupplierReturn, { foreignKey: 'return_id', as: 'return' });
+
+  SupplierReturnItem.belongsTo(Product, { foreignKey: 'product_id', as: 'product' });
+  SupplierReturnItem.belongsTo(StockBatch, { foreignKey: 'batch_id', as: 'batch' });
+
+  SupplierReturn.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+  SupplierReturn.belongsTo(UserAccount, { foreignKey: 'settled_by', as: 'settledBy' });
+  SupplierReturn.belongsTo(PaymentMethod, { foreignKey: 'refunded_method_id', as: 'refundedMethod' });
+
+  OperationalExpense.belongsTo(UserAccount, { foreignKey: 'created_by', as: 'creator' });
+
   associated = true;
 }
 
@@ -176,6 +206,7 @@ export {
   CashSession,
   Customer,
   IdempotencyKey,
+  OperationalExpense,
   Payment,
   PaymentMethod,
   Product,
@@ -191,6 +222,8 @@ export {
   StockOpname,
   StockOpnameItem,
   StoreProfile,
+  SupplierReturn,
+  SupplierReturnItem,
   UserAccount,
 };
 export type { ModuleEntitlement, StoreModules, AccountStatus } from './store-profile.model.js';
@@ -223,3 +256,20 @@ export type {
   StockOpnameItemCreationAttributes,
   OpnameCause,
 } from './stock-opname-item.model.js';
+export type {
+  SupplierReturnAttributes,
+  SupplierReturnCreationAttributes,
+  SupplierReturnStatus,
+  SupplierReturnSettleType,
+  SupplierReturnItemRef,
+} from './supplier-return.model.js';
+export type {
+  SupplierReturnItemAttributes,
+  SupplierReturnItemCreationAttributes,
+  SupplierReturnCondition,
+} from './supplier-return-item.model.js';
+export type {
+  OperationalExpenseAttributes,
+  OperationalExpenseCreationAttributes,
+  ExpenseSource,
+} from './operational-expense.model.js';

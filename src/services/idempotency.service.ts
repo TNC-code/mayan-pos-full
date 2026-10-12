@@ -1,6 +1,5 @@
-import type { PoolClient } from 'pg';
 import type { Transaction } from 'sequelize';
-import { pool, withTransaction } from '../config/db.js';
+import { pool } from '../config/db.js';
 import { ApiError } from '../utils/errors.js';
 import { withOrmTx, withRetry } from '../utils/tx.js';
 import { IdempotencyKey } from '../models/index.js';
@@ -32,84 +31,30 @@ interface StoredResponse<T> {
  * ROLLBACK termasuk key-nya -> client boleh retry dengan key yang sama setelah
  * memperbaiki request. Kalau sukses, retry dengan key sama = replay response.
  *
- * CATATAN MP-4: ini masih jalur `pg.Pool` untuk service yang BELUM pindah ke
- * Sequelize (`supplier-return`, dan service MP-5+ yang menyusul). Service yang
- * sudah di atas ORM memakai `runOrmIdempotent` di bawah — keduanya menulis ke
- * tabel yang sama dengan format payload yang sama, jadi key bisa dipindah dari
- * satu jalur ke jalur lain tanpa bentrok.
+ * CATATAN MP-6: service yang masih raw SQL tinggal `order-book.service.ts`
+ * (MP-7), dan path raw itu sudah DIHAPUS (MP-6 memindahkan supplier-return ke
+ * ORM) — dari MP-7 seterusnya semua idempotency lewat `runOrmIdempotent` di
+ * bawah. Format payload `idempotency_keys.response` & nama tabelnya SAMA, jadi
+ * key yang dibuat versi lama (`{scope, state, status, body}`) tetap bisa
+ * di-replay tanpa migrasi data.
  */
-export async function runIdempotent<T>(
-  scope: string,
-  key: string,
-  work: (client: PoolClient) => Promise<{ status: number; body: T }>,
-): Promise<IdempotentResult<T>> {
-  return withRetry(
-    () =>
-      withTransaction(async (client) => {
-        const claim = await client.query<{ key: string }>(
-          `INSERT INTO public.idempotency_keys (key, response)
-           VALUES ($1, $2::jsonb)
-           ON CONFLICT (key) DO NOTHING
-           RETURNING key`,
-          [key, JSON.stringify({ scope, state: 'in_progress' })],
-        );
-
-        if (claim.rowCount === 0) {
-          // Key sudah dipakai request sebelumnya -> cukup kembalikan response tersimpan.
-          await client.query('ROLLBACK');
-          return { replayed: true, ...(await readStored<T>(scope, key)) };
-        }
-
-        const result = await work(client);
-
-        await client.query(`UPDATE public.idempotency_keys SET response = $2::jsonb WHERE key = $1`, [
-          key,
-          JSON.stringify({ scope, state: 'done', status: result.status, body: result.body }),
-        ]);
-
-        return { replayed: false, status: result.status, body: result.body };
-      }),
-    `idempotent:${scope}`,
-  );
-}
-
-async function readStored<T>(scope: string, key: string): Promise<{ status: number; body: T }> {
-  const res = await pool.query<{ response: StoredResponse<T> & { state?: string } }>(
-    `SELECT response FROM public.idempotency_keys WHERE key = $1`,
-    [key],
-  );
-
-  const stored = res.rows[0]?.response;
-  if (!stored || stored.state !== 'done') {
-    throw new ApiError('CONCURRENT_CONFLICT', 'Permintaan dengan Idempotency-Key yang sama sedang diproses, coba lagi');
-  }
-  if (stored.scope !== scope) {
-    throw new ApiError(
-      'VALIDATION_ERROR',
-      `Idempotency-Key sudah dipakai pada endpoint ${stored.scope}, gunakan key baru untuk ${scope}`,
-    );
-  }
-
-  return { status: stored.status, body: stored.body };
-}
 
 /**
- * Idempotency untuk service di atas Sequelize (MP-4.2) — identik dengan
- * `runIdempotent` (payload & tabel sama), hanya sisi eksekusinya ORM:
+ * Idempotency untuk service di atas Sequelize (dipakai sejak MP-4) — payload,
+ * tabel, dan retry policy identik dengan jalur raw SQL yang dulu ada di sini:
  *
  *  1. Klaim key via `IdempotencyKey.findCreateFind({ where: { key }, defaults })`.
  *     Di dialect postgres Sequelize memakai `INSERT ... ON CONFLICT DO NOTHING
  *     RETURNING *` untuk langkah INSERT-nya: kalau key sudah dipakai transaksi
  *     lain, PostgreSQL menunggu transaksi itu commit sebelum balasan INSERT
  *     keluar — jadi response yang dibaca di bawah sudah pasti committed (tidak
- *     ada race "replay dapat body setengah jadi"), persis seperti
- *     `claim.rowCount === 0` di jalur raw SQL. Row `created: false` = key sudah
+ *     ada race "replay dapat body setengah jadi"). Row `created: false` = key sudah
  *     dipakai request lain.
  *  2. `work(transaction)` — logic bisnis dalam transaksi yang sama, jadi
  *     key ikut ROLLBACK saat logic gagal (retry dengan key sama diizinkan).
  *  3. Simpan response sukses ke `idempotency_keys.response` sebelum COMMIT.
  *
- * Retry policy identik (`withRetry`): hanya error koneksi/serialisasi/deadlock.
+ * Retry policy (`withRetry`): hanya error koneksi/serialisasi/deadlock.
  */
 export async function runOrmIdempotent<T>(
   scope: string,

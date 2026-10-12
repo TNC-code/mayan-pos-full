@@ -1,6 +1,29 @@
-import { pool } from '../config/db.js';
+import { QueryTypes } from 'sequelize';
 import { env } from '../config/env.js';
 import { round2 } from '../utils/tx.js';
+import { sequelize } from '../models/index.js';
+
+/**
+ * Laporan OWNER di atas Sequelize (MP-6) — HYBRID dengan sengaja (plan §D4).
+ *
+ * Semua query di file ini adalah SQL VERBATIM dari versi raw SQL lama
+ * (`git show e33b3b5:src/services/report.service.ts`); yang berubah hanya
+ * transport `pool.query(sql, args)` -> `sequelize.query(sql, { bind })`.
+ * Alasannya tidak ditulis ulang jadi builder ORM:
+ *  1. bentuk response FE tidak boleh bergeser (openapi sudah jadi kontrak),
+ *  2. agregasinya berat & berantai lintas tabel (HPP dari `sale_items × batch`,
+ *     nilai selisih opname dari unit_cost acuan per batch, tren 6 bulan dengan
+ *     `generate_series`, agregat `HAVING` untuk low stock),
+ *  3. optimasi yang sudah teruji ikut terjaga, termasuk partial index
+ *     `idx_supplier_returns_is_test` (T9) yang dipakai query `refund_distributor`.
+ *
+ * Tidak ada penulisan data di file ini — laporan hanya membaca, jadi tidak ada
+ * `transaction` yang perlu dioper. Angka `numeric`/`bigint` tetap NUMBER karena
+ * parser OID yang sama dipasang di `src/db/sequelize.ts` (parity dengan pool).
+ *
+ * Tanggal/waktu selalu dihitung dari jam DB (`now()`), zona bisnis dari env
+ * `BUSINESS_TZ` (bukan input user) — kedua hal ini tidak berubah dari versi lama.
+ */
 
 export interface PnlCategoryRow {
   category: string;
@@ -36,12 +59,22 @@ export interface DashboardReport {
 }
 
 /**
+ * Jalur baca laporan: `sequelize.query` + bind positional (`$1`, `$2`, ...).
+ * Nilai user TIDAK PERNAH masuk ke string SQL — hanya lewat `bind`.
+ * `bind` dikosongkan (query tanpa parameter) dilewatkan tanpa opsi bind sama sekali.
+ */
+async function sql<T>(text: string, bind: unknown[] = []): Promise<T[]> {
+  const options = bind.length > 0 ? { bind } : {};
+  return (await sequelize.query(text, { ...options, type: QueryTypes.SELECT })) as T[];
+}
+
+/**
  * Laporan Laba-Rugi periode bulanan (basis akrual: penjualan COMPLETED di bulan tsb).
  * Data uji dikecualikan secara default dari SELURUH laporan: `sales.is_test`,
  * `operational_expenses.is_test` (T6) dan `supplier_returns.is_test` (T9). OWNER bisa
  * melihat semuanya sekaligus dengan `?include_test=true` (padanan `GET /expenses`).
  * laba_kotor = pendapatan - HPP;
- * laba_bersih = laba_kotor + refund_distributor - beban operasional;
+ * laba_bersih = laba_kotor + refund_distributor - beban_operasional;
  * laba_netto = laba_bersih (pajak belum dimodelkan).
  *
  * `refund_distributor` = uang yang dikembalikan distributor untuk barang rusak yang sudah
@@ -56,20 +89,20 @@ export async function pnlReport(month: string, opts: { includeTest?: boolean } =
   const includeTest = opts.includeTest === true;
   const gate = (col: string) => (includeTest ? 'true' : `${col} = false`);
 
-  const res = await pool.query<{ revenue: string | null; hpp: string | null; trx: string | null; ppn: string | null }>(
+  const [sales] = await sql<{ revenue: string | null; hpp: string | null; trx: string | null; ppn: string | null }>(
     `SELECT SUM(s.total_amount) AS revenue,
             SUM(si.hpp) AS hpp,
             SUM(s.tax_amount) AS ppn,
             COUNT(DISTINCT s.id) AS trx
        FROM sales s
-       JOIN (SELECT sale_id, SUM(unit_cost * qty) AS hpp FROM sale_items GROUP BY sale_id) si
-         ON si.sale_id = s.id
+      JOIN (SELECT sale_id, SUM(unit_cost * qty) AS hpp FROM sale_items GROUP BY sale_id) si
+        ON si.sale_id = s.id
       WHERE s.status = 'COMPLETED' AND ${gate('s.is_test')}
         AND to_char(s.sale_date AT TIME ZONE $2, 'YYYY-MM') = $1`,
     [month, env.businessTz],
   );
 
-  const refunds = await pool.query<{ total: string | null }>(
+  const [refunds] = await sql<{ total: string | null }>(
     `SELECT COALESCE(SUM(r.amount), 0) AS total
        FROM refunds r JOIN sales s ON s.id = r.sale_id
       WHERE ${gate('s.is_test')}
@@ -77,7 +110,7 @@ export async function pnlReport(month: string, opts: { includeTest?: boolean } =
     [month, env.businessTz],
   );
 
-  const opex = await pool.query<PnlCategoryRow>(
+  const opex = await sql<PnlCategoryRow>(
     `SELECT category, SUM(amount)::numeric(14,2) AS total_amount, COUNT(*)::int AS count
        FROM operational_expenses
       WHERE ${gate('is_test')}
@@ -89,7 +122,7 @@ export async function pnlReport(month: string, opts: { includeTest?: boolean } =
   // Pendapatan lain: retur barang rusak ke distributor yang dibayar balik (settle REFUNDED).
   // Dihitung per `refunded_at` (bukan created_at) supaya uang masuk diakui pada periode dibayar.
   // T9: retur uji (supplier_returns.is_test) dikecualikan; `?include_test=true` menampilkannya.
-  const refundDistributor = await pool.query<{ total: string | null }>(
+  const [refundDistributor] = await sql<{ total: string | null }>(
     `SELECT COALESCE(SUM(refunded_amount), 0) AS total
        FROM supplier_returns
       WHERE status = 'REFUNDED' AND refunded_at IS NOT NULL AND ${gate('is_test')}
@@ -97,18 +130,18 @@ export async function pnlReport(month: string, opts: { includeTest?: boolean } =
     [month, env.businessTz],
   );
 
-  const piutang = await pool.query<{ total: string | null }>(
+  const [piutang] = await sql<{ total: string | null }>(
     `SELECT COALESCE(SUM(total_amount - COALESCE(paid.paid, 0)), 0) AS total
        FROM sales s
-       LEFT JOIN (SELECT sale_id, SUM(amount) AS paid FROM payments GROUP BY sale_id) paid ON paid.sale_id = s.id
+      LEFT JOIN (SELECT sale_id, SUM(amount) AS paid FROM payments GROUP BY sale_id) paid ON paid.sale_id = s.id
       WHERE s.status = 'COMPLETED' AND ${gate('s.is_test')}
         AND s.payment_status IN ('UNPAID', 'PARTIAL')`,
   );
 
-  const revenue = Number(res.rows[0]?.revenue ?? 0);
-  const hpp = Number(res.rows[0]?.hpp ?? 0);
-  const totalOpex = opex.rows.reduce((acc, r) => acc + Number(r.total_amount), 0);
-  const refundDistributorTotal = Number(refundDistributor.rows[0]?.total ?? 0);
+  const revenue = Number(sales?.revenue ?? 0);
+  const hpp = Number(sales?.hpp ?? 0);
+  const totalOpex = opex.reduce((acc, r) => acc + Number(r.total_amount), 0);
+  const refundDistributorTotal = Number(refundDistributor?.total ?? 0);
   const labaKotor = revenue - hpp;
   const labaBersih = round2(labaKotor + refundDistributorTotal - totalOpex);
 
@@ -117,15 +150,15 @@ export async function pnlReport(month: string, opts: { includeTest?: boolean } =
     pendapatan: revenue,
     hpp,
     laba_kotor: labaKotor,
-    beban_operasional: opex.rows.map((r) => ({ ...r, total_amount: Number(r.total_amount) })),
+    beban_operasional: opex.map((r) => ({ ...r, total_amount: Number(r.total_amount) })),
     total_beban_operasional: totalOpex,
     refund_distributor: refundDistributorTotal,
     laba_bersih: labaBersih,
     laba_netto: labaBersih,
-    ppn_diterima: Number(res.rows[0]?.ppn ?? 0),
-    total_refund: Number(refunds.rows[0]?.total ?? 0),
-    jml_transaksi: Number(res.rows[0]?.trx ?? 0),
-    piutang_berjalan: Number(piutang.rows[0]?.total ?? 0),
+    ppn_diterima: Number(sales?.ppn ?? 0),
+    total_refund: Number(refunds?.total ?? 0),
+    jml_transaksi: Number(sales?.trx ?? 0),
+    piutang_berjalan: Number(piutang?.total ?? 0),
     note:
       'Basis akrual (penjualan COMPLETED periode tsb, data uji dikecualikan: sales/opex/retur distributor is_test). ' +
       'laba_bersih = laba_kotor + refund_distributor - beban_operasional; ' +
@@ -136,47 +169,49 @@ export async function pnlReport(month: string, opts: { includeTest?: boolean } =
 
 /** Dashboard owner: ringkasan hari ini (TZ bisnis) + indikator stok & kas. */
 export async function dashboard(): Promise<DashboardReport> {
-  const today = await pool.query<{ revenue: string | null; hpp: string | null; trx: string | null }>(
+  const [today] = await sql<{ revenue: string | null; hpp: string | null; trx: string | null }>(
     `SELECT SUM(s.total_amount) AS revenue,
             SUM(si.hpp) AS hpp,
             COUNT(DISTINCT s.id) AS trx
        FROM sales s
-       JOIN (SELECT sale_id, SUM(unit_cost * qty) AS hpp FROM sale_items GROUP BY sale_id) si ON si.sale_id = s.id
+      JOIN (SELECT sale_id, SUM(unit_cost * qty) AS hpp FROM sale_items GROUP BY sale_id) si ON si.sale_id = s.id
       WHERE s.status = 'COMPLETED' AND s.is_test = false
         AND (s.sale_date AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date`,
     [env.businessTz],
   );
 
-  const piutang = await pool.query<{ total: string | null }>(
+  const [piutang] = await sql<{ total: string | null }>(
     `SELECT COALESCE(SUM(total_amount - COALESCE(paid.paid, 0)), 0) AS total
        FROM sales s
-       LEFT JOIN (SELECT sale_id, SUM(amount) AS paid FROM payments GROUP BY sale_id) paid ON paid.sale_id = s.id
+      LEFT JOIN (SELECT sale_id, SUM(amount) AS paid FROM payments GROUP BY sale_id) paid ON paid.sale_id = s.id
       WHERE s.status = 'COMPLETED' AND s.is_test = false AND s.payment_status IN ('UNPAID', 'PARTIAL')`,
   );
 
-  const lowStock = await pool.query<{ count: number }>(
+  const lowStock = await sql<{ count: number }>(
     `SELECT COUNT(*)::int AS count
        FROM product p
-       LEFT JOIN stock_batches b ON b.product_id = p.id
+      LEFT JOIN stock_batches b ON b.product_id = p.id
       WHERE p.is_active AND p.min_stock > 0
       GROUP BY p.id, p.min_stock
      HAVING COALESCE(SUM(b.qty_remaining), 0) < p.min_stock`,
   );
-  const lowStockCount = lowStock.rows.reduce((acc, r) => acc + 1, 0);
+  const lowStockCount = lowStock.reduce((acc, r) => acc + 1, 0);
 
-  const expiring = await pool.query<{ count: number }>(
+  const [expiring] = await sql<{ count: number }>(
     `SELECT COUNT(*)::int AS count FROM stock_batches
       WHERE qty_remaining > 0 AND expired_date IS NOT NULL
         AND expired_date <= CURRENT_DATE + 30`,
   );
 
-  const openSessions = await pool.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM cash_sessions WHERE status = 'OPEN'`);
+  const [openSessions] = await sql<{ count: number }>(
+    `SELECT COUNT(*)::int AS count FROM cash_sessions WHERE status = 'OPEN'`,
+  );
 
-  const top = await pool.query<{ product_id: number; name: string; qty: string | null; revenue: string | null }>(
+  const top = await sql<{ product_id: number; name: string; qty: string | null; revenue: string | null }>(
     `SELECT si.product_id, p.name, SUM(si.qty) AS qty, SUM(si.subtotal) AS revenue
        FROM sale_items si
-       JOIN sales s ON s.id = si.sale_id
-       JOIN product p ON p.id = si.product_id
+      JOIN sales s ON s.id = si.sale_id
+      JOIN product p ON p.id = si.product_id
       WHERE s.status = 'COMPLETED' AND s.is_test = false
         AND to_char(s.sale_date AT TIME ZONE $1, 'YYYY-MM') = to_char(now() AT TIME ZONE $1, 'YYYY-MM')
       GROUP BY si.product_id, p.name ORDER BY SUM(si.subtotal) DESC LIMIT 5`,
@@ -185,16 +220,16 @@ export async function dashboard(): Promise<DashboardReport> {
 
   return {
     today: {
-      pendapatan: Number(today.rows[0]?.revenue ?? 0),
-      hpp: Number(today.rows[0]?.hpp ?? 0),
-      laba_kotor: Number(today.rows[0]?.revenue ?? 0) - Number(today.rows[0]?.hpp ?? 0),
-      jml_transaksi: Number(today.rows[0]?.trx ?? 0),
+      pendapatan: Number(today?.revenue ?? 0),
+      hpp: Number(today?.hpp ?? 0),
+      laba_kotor: Number(today?.revenue ?? 0) - Number(today?.hpp ?? 0),
+      jml_transaksi: Number(today?.trx ?? 0),
     },
-    piutang_berjalan: Number(piutang.rows[0]?.total ?? 0),
+    piutang_berjalan: Number(piutang?.total ?? 0),
     low_stock_count: lowStockCount,
-    expiring_count: Number(expiring.rows[0]?.count ?? 0),
-    open_cash_sessions: Number(openSessions.rows[0]?.count ?? 0),
-    top_products: top.rows.map((r) => ({ ...r, qty: Number(r.qty ?? 0), revenue: Number(r.revenue ?? 0) })),
+    expiring_count: Number(expiring?.count ?? 0),
+    open_cash_sessions: Number(openSessions?.count ?? 0),
+    top_products: top.map((r) => ({ ...r, qty: Number(r.qty ?? 0), revenue: Number(r.revenue ?? 0) })),
   };
 }
 
@@ -205,7 +240,7 @@ export async function alerts(): Promise<{
   damaged_stock: Array<{ batch_id: number; batch_code: string; product_name: string; qty_damaged: number; value: number }>;
   damaged_stock_total: { qty: number; value: number; pending_returns: number };
 }> {
-  const low = await pool.query<{
+  const low = await sql<{
     product_id: number;
     sku: string | null;
     name: string;
@@ -220,7 +255,7 @@ export async function alerts(): Promise<{
       ORDER BY p.name`,
   );
 
-  const exp = await pool.query<{
+  const exp = await sql<{
     batch_id: number;
     batch_code: string;
     product_name: string;
@@ -235,7 +270,7 @@ export async function alerts(): Promise<{
       ORDER BY b.expired_date ASC`,
   );
 
-  const damaged = await pool.query<{
+  const damaged = await sql<{
     batch_id: number;
     batch_code: string;
     product_name: string;
@@ -249,7 +284,7 @@ export async function alerts(): Promise<{
       ORDER BY value DESC`,
   );
 
-  const damagedPending = await pool.query<{ qty: string; value: string; pending: number }>(
+  const [damagedPending] = await sql<{ qty: string; value: string; pending: number }>(
     `SELECT COALESCE(sum(b.qty_damaged), 0)::numeric(14,3) AS qty,
             COALESCE(sum(b.qty_damaged * b.unit_cost), 0)::numeric(14,2) AS value,
             (SELECT count(*)::int FROM supplier_returns WHERE status = 'PENDING') AS pending
@@ -257,14 +292,14 @@ export async function alerts(): Promise<{
   );
 
   return {
-    low_stock: low.rows.map((r) => ({
+    low_stock: low.map((r) => ({
       product_id: r.product_id,
       sku: r.sku,
       name: r.name,
       qty_on_hand: Number(r.qty_on_hand),
       min_stock: Number(r.min_stock),
     })),
-    expiring: exp.rows.map((r) => ({
+    expiring: exp.map((r) => ({
       batch_id: r.batch_id,
       batch_code: r.batch_code,
       product_name: r.product_name,
@@ -272,7 +307,7 @@ export async function alerts(): Promise<{
       expired_date: r.expired_date,
       days_left: Number(r.days_left),
     })),
-    damaged_stock: damaged.rows.map((r) => ({
+    damaged_stock: damaged.map((r) => ({
       batch_id: r.batch_id,
       batch_code: r.batch_code,
       product_name: r.product_name,
@@ -280,9 +315,9 @@ export async function alerts(): Promise<{
       value: Number(r.value),
     })),
     damaged_stock_total: {
-      qty: Number(damagedPending.rows[0]?.qty ?? 0),
-      value: Number(damagedPending.rows[0]?.value ?? 0),
-      pending_returns: Number(damagedPending.rows[0]?.pending ?? 0),
+      qty: Number(damagedPending?.qty ?? 0),
+      value: Number(damagedPending?.value ?? 0),
+      pending_returns: Number(damagedPending?.pending ?? 0),
     },
   };
 }
@@ -351,7 +386,7 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
     )
   `;
 
-  const summary = await pool.query<{
+  const [summary] = await sql<{
     opname_count: string;
     item_count: string;
     diff_qty: string;
@@ -364,26 +399,26 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
             COALESCE(sum(i.damaged_difference), 0)::numeric(14,3) AS diff_qty_damaged,
             COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)::numeric(14,2) AS nilai
        FROM stock_opnames o
-       JOIN stock_opname_items i ON i.opname_id = o.id
+      JOIN stock_opname_items i ON i.opname_id = o.id
       WHERE to_char(o.opname_date, 'YYYY-MM') = $1`,
     [month],
   );
 
-  const cause = await pool.query<{ cause: string; items: string; qty: string; dmg: string; nilai: string; nilai_dmg: string }>(
+  const cause = await sql<{ cause: string; items: string; qty: string; dmg: string; nilai: string; nilai_dmg: string }>(
     `SELECT i.cause, count(*)::text AS items,
             COALESCE(sum(i.difference), 0)::numeric(14,3) AS qty,
             COALESCE(sum(i.damaged_difference), 0)::numeric(14,3) AS dmg,
             COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)::numeric(14,2) AS nilai,
             COALESCE(sum(i.damaged_difference * (${unitCostExpr})), 0)::numeric(14,2) AS nilai_dmg
        FROM stock_opnames o
-       JOIN stock_opname_items i ON i.opname_id = o.id
+      JOIN stock_opname_items i ON i.opname_id = o.id
       WHERE to_char(o.opname_date, 'YYYY-MM') = $1 AND i.cause IS NOT NULL
       GROUP BY i.cause
       ORDER BY abs(COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)) DESC`,
     [month],
   );
 
-  const kategori = await pool.query<{
+  const kategori = await sql<{
     category_id: number | null;
     category: string;
     qty: string;
@@ -395,16 +430,16 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
             COALESCE(sum(i.damaged_difference), 0)::numeric(14,3) AS dmg,
             COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)::numeric(14,2) AS nilai
        FROM stock_opnames o
-       JOIN stock_opname_items i ON i.opname_id = o.id
-       JOIN product p ON p.id = i.product_id
-       LEFT JOIN product_category pc ON pc.id = p.category_id
+      JOIN stock_opname_items i ON i.opname_id = o.id
+      JOIN product p ON p.id = i.product_id
+      LEFT JOIN product_category pc ON pc.id = p.category_id
       WHERE to_char(o.opname_date, 'YYYY-MM') = $1
       GROUP BY p.category_id, COALESCE(pc.name, '(tanpa kategori)')
       ORDER BY abs(COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)) DESC`,
     [month],
   );
 
-  const top = await pool.query<{
+  const top = await sql<{
     product_id: number;
     name: string;
     qty: string;
@@ -416,8 +451,8 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
             COALESCE(sum(i.damaged_difference), 0)::numeric(14,3) AS dmg,
             COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)::numeric(14,2) AS nilai
        FROM stock_opnames o
-       JOIN stock_opname_items i ON i.opname_id = o.id
-       JOIN product p ON p.id = i.product_id
+      JOIN stock_opname_items i ON i.opname_id = o.id
+      JOIN product p ON p.id = i.product_id
       WHERE to_char(o.opname_date, 'YYYY-MM') = $1
       GROUP BY p.id, p.name
       ORDER BY abs(COALESCE(sum((i.difference + i.damaged_difference) * (${unitCostExpr})), 0)) DESC
@@ -427,7 +462,7 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
 
   // Tren 6 bulan terakhir (termasuk bulan yang diminta) memakai generate_series supaya
   // bulan tanpa opname tetap muncul sebagai 0 (grafik tidak bolong).
-  const tren = await pool.query<{ month: string; opname_count: string; qty: string; nilai: string }>(
+  const tren = await sql<{ month: string; opname_count: string; qty: string; nilai: string }>(
     `SELECT to_char(m.period, 'YYYY-MM') AS month,
             count(DISTINCT o.id)::text AS opname_count,
             COALESCE(sum(i.difference + i.damaged_difference), 0)::numeric(14,3) AS qty,
@@ -436,40 +471,39 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
               date_trunc('month', to_date($1, 'YYYY-MM'))::date - interval '5 months',
               date_trunc('month', to_date($1, 'YYYY-MM'))::date,
               interval '1 month') AS m(period)
-       LEFT JOIN stock_opnames o
+      LEFT JOIN stock_opnames o
               ON o.opname_date >= m.period::date
              AND o.opname_date < (m.period + interval '1 month')::date
-       LEFT JOIN stock_opname_items i ON i.opname_id = o.id
+      LEFT JOIN stock_opname_items i ON i.opname_id = o.id
       GROUP BY m.period ORDER BY m.period ASC`,
     [month],
   );
 
-  const rusak = await pool.query<{ qty: string; nilai: string; batches: number }>(
+  const [rusak] = await sql<{ qty: string; nilai: string; batches: number }>(
     `SELECT COALESCE(sum(b.qty_damaged), 0)::numeric(14,3) AS qty,
             COALESCE(sum(b.qty_damaged * b.unit_cost), 0)::numeric(14,2) AS nilai,
             count(*)::int AS batches
        FROM stock_batches b WHERE b.qty_damaged > 0`,
   );
 
-  const pending = await pool.query<{ n: number; nilai: string }>(
+  const [pending] = await sql<{ n: number; nilai: string }>(
     `SELECT count(*)::int AS n, COALESCE(sum(total_cost), 0)::numeric(14,2) AS nilai
        FROM supplier_returns WHERE status = 'PENDING'`,
   );
 
-  const s = summary.rows[0];
-  const nilai = Number(s?.nilai ?? 0);
+  const nilai = Number(summary?.nilai ?? 0);
   return {
     period: month,
     total: {
-      opname_count: Number(s?.opname_count ?? 0),
-      item_count: Number(s?.item_count ?? 0),
-      selisih_qty: Number(s?.diff_qty ?? 0),
-      selisih_qty_damaged: Number(s?.diff_qty_damaged ?? 0),
+      opname_count: Number(summary?.opname_count ?? 0),
+      item_count: Number(summary?.item_count ?? 0),
+      selisih_qty: Number(summary?.diff_qty ?? 0),
+      selisih_qty_damaged: Number(summary?.diff_qty_damaged ?? 0),
       nilai_selisih: nilai,
       nilai_rugi: nilai < 0 ? round2(Math.abs(nilai)) : 0,
       nilai_lebih: nilai > 0 ? round2(nilai) : 0,
     },
-    per_cause: cause.rows.map((r) => ({
+    per_cause: cause.map((r) => ({
       cause: r.cause,
       item_count: Number(r.items),
       selisih_qty: Number(r.qty),
@@ -477,32 +511,32 @@ export async function opnameReport(month: string): Promise<OpnameReport> {
       nilai_selisih: Number(r.nilai),
       nilai_selisih_damaged: Number(r.nilai_dmg),
     })),
-    per_kategori: kategori.rows.map((r) => ({
+    per_kategori: kategori.map((r) => ({
       category_id: r.category_id,
       category: r.category,
       selisih_qty: Number(r.qty),
       selisih_qty_damaged: Number(r.dmg),
       nilai_selisih: Number(r.nilai),
     })),
-    top_produk: top.rows.map((r) => ({
+    top_produk: top.map((r) => ({
       product_id: r.product_id,
       name: r.name,
       selisih_qty: Number(r.qty),
       selisih_qty_damaged: Number(r.dmg),
       nilai_selisih: Number(r.nilai),
     })),
-    tren_6_bulan: tren.rows.map((r) => ({
+    tren_6_bulan: tren.map((r) => ({
       month: r.month,
       opname_count: Number(r.opname_count),
       selisih_qty: Number(r.qty),
       nilai_selisih: Number(r.nilai),
     })),
     stok_rusak_belum_diretur: {
-      qty: Number(rusak.rows[0]?.qty ?? 0),
-      nilai: Number(rusak.rows[0]?.nilai ?? 0),
-      batch_count: Number(rusak.rows[0]?.batches ?? 0),
-      pending_return_count: Number(pending.rows[0]?.n ?? 0),
-      pending_return_value: Number(pending.rows[0]?.nilai ?? 0),
+      qty: Number(rusak?.qty ?? 0),
+      nilai: Number(rusak?.nilai ?? 0),
+      batch_count: Number(rusak?.batches ?? 0),
+      pending_return_count: Number(pending?.n ?? 0),
+      pending_return_value: Number(pending?.nilai ?? 0),
     },
     note:
       'Selisih = (physical - system) untuk barang GOOD + RUSAK. Nilai rupiah memakai unit_cost batch ' +

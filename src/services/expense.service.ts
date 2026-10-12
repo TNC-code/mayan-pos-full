@@ -1,11 +1,33 @@
-import type { PoolClient } from 'pg';
-import { pool } from '../config/db.js';
+import { Op, Sequelize, type Includeable, type Transaction } from 'sequelize';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/errors.js';
-import { withTx } from '../utils/tx.js';
+import { withOrmTx } from '../utils/tx.js';
+import { mapOrmError } from '../utils/orm-errors.js';
+import { isoDateOnly } from '../utils/dates.js';
+import { OperationalExpense, UserAccount } from '../models/index.js';
+
+/**
+ * Opex operasional di atas Sequelize (MP-6).
+ *
+ * Paritas penuh dengan versi raw SQL lama
+ * (`git show e33b3b5:src/services/expense.service.ts`): bentuk response
+ * `ExpenseRow`, urutan list (`expense_date DESC, id DESC`), normalisasi kategori
+ * (UPPERCASE + underscore dari zod), `is_test` disembunyikan default, dan —
+ * yang paling penting — `recordWriteOffExpense` yang WAJIB dipanggil di dalam
+ * transaksi settle retur distributor (`supplier-return.service.ts`) supaya
+ * retur + opex bersifat atomik.
+ *
+ * Yang tetap milik DB: CHECK `chk_opex_amount_positive` (amount > 0),
+ * DEFAULT `CURRENT_DATE` untuk `expense_date`, FK `supplier_return_id`, dan
+ * `updated_at` yang di-`touch` setiap koreksi.
+ *
+ * RBAC TIDAK dicek di service (sudah di route: OWNER untuk list/get/create/
+ * update) — service ini murni lapisan data, seperti versi lamanya.
+ */
 
 export interface ExpenseRow {
   id: number;
+  /** Bentuk wire lama: kolom `date` diserialisasi sebagai ISO (`…T00:00:00.000Z`). */
   expense_date: string;
   category: string;
   description: string | null;
@@ -21,51 +43,85 @@ export interface ExpenseRow {
   is_test: boolean;
 }
 
-const SELECT_EXPENSE = `
-  SELECT e.id, e.expense_date, e.category, e.description, e.amount,
-         e.created_by, u.username AS created_by_name, e.created_at, e.updated_at,
-         e.source, e.supplier_return_id, e.is_test
-    FROM operational_expenses e
-    LEFT JOIN user_account u ON u.id = e.created_by
-`;
+const WITH_CREATOR: Includeable = {
+  model: UserAccount,
+  as: 'creator',
+  attributes: ['id', 'username'],
+  required: false,
+};
 
-export async function listExpenses(params: {
+const EXPENSE_INCLUDES: Includeable[] = [WITH_CREATOR];
+
+type ExpenseWithCreator = OperationalExpense & { creator?: { id: number; username: string } | null };
+
+function toExpenseRow(row: ExpenseWithCreator): ExpenseRow {
+  return {
+    id: row.id,
+    expense_date: isoDateOnly(row.expense_date) as string,
+    category: row.category,
+    description: row.description,
+    amount: row.amount,
+    created_by: row.created_by,
+    created_by_name: row.creator?.username ?? null,
+    created_at: new Date(row.created_at).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(),
+    source: row.source,
+    supplier_return_id: row.supplier_return_id,
+    is_test: row.is_test,
+  };
+}
+
+/* ================================= daftar opex ================================= */
+
+export interface ExpenseListQuery {
   month?: string;
   category?: string;
   include_test?: boolean;
   limit: number;
   offset: number;
-}): Promise<ExpenseRow[]> {
-  const args: unknown[] = [];
-  const where: string[] = [];
-
-  // Default: opex dari skrip uji tidak ikut daftar produksi (padanan sales.is_test).
-  if (!params.include_test) {
-    where.push('e.is_test = false');
-  }
-  if (params.month) {
-    args.push(params.month);
-    where.push(`to_char(e.expense_date, 'YYYY-MM') = $${args.length}`);
-  }
-  if (params.category) {
-    args.push(params.category.toUpperCase());
-    where.push(`e.category = $${args.length}`);
-  }
-
-  args.push(params.limit, params.offset);
-  const res = await pool.query<ExpenseRow>(
-    `${SELECT_EXPENSE} ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''}
-     ORDER BY e.expense_date DESC, e.id DESC LIMIT $${args.length - 1} OFFSET $${args.length}`,
-    args as never[],
-  );
-  return res.rows;
 }
 
-export async function getExpense(id: number, client: PoolClient | null = null): Promise<ExpenseRow> {
-  const runner = client ? client.query.bind(client) : pool.query.bind(pool);
-  const res = await runner<ExpenseRow>(`${SELECT_EXPENSE} WHERE e.id = $1`, [id]);
-  if (!res.rows[0]) throw new ApiError('EXPENSE_NOT_FOUND', `Pengeluaran id=${id} tidak ditemukan`);
-  return res.rows[0];
+/**
+ * `GET /expenses` (OWNER). Default `id`-descending per tanggal paling baru:
+ * `expense_date DESC, id DESC`. Baris `is_test = true` disembunyikan kecuali
+ * `?include_test=true` (padanan `GET /sales`).
+ */
+export async function listExpenses(params: ExpenseListQuery): Promise<ExpenseRow[]> {
+  const conditions: Record<string, unknown>[] = [];
+
+  if (!params.include_test) conditions.push({ is_test: false });
+  if (params.category) conditions.push({ category: params.category.trim().toUpperCase() });
+  // `expense_date` kolom `date`: filter bulan lewat ekspresi yang sama dengan
+  // versi lama (`to_char(expense_date, 'YYYY-MM') = $1`).
+  if (params.month) {
+    conditions.push(
+      Sequelize.where(Sequelize.fn('to_char', Sequelize.col('expense_date'), 'YYYY-MM'), params.month) as never,
+    );
+  }
+
+  const rows = await OperationalExpense.findAll({
+    where: { [Op.and]: conditions },
+    include: EXPENSE_INCLUDES,
+    // Include 1:1 (belongsTo) -> jumlah baris tidak berubah, LIMIT/OFFSET aman.
+    subQuery: false,
+    order: [
+      ['expense_date', 'DESC'],
+      ['id', 'DESC'],
+    ],
+    limit: params.limit,
+    offset: params.offset,
+  });
+
+  return (rows as unknown as ExpenseWithCreator[]).map(toExpenseRow);
+}
+
+/* ================================= detail opex ================================= */
+
+/** `GET /expenses/:id` — boleh dipanggil di dalam transaksi (langsung setelah create). */
+export async function getExpense(id: number, transaction?: Transaction): Promise<ExpenseRow> {
+  const row = await OperationalExpense.findByPk(id, { include: EXPENSE_INCLUDES, transaction });
+  if (!row) throw new ApiError('EXPENSE_NOT_FOUND', `Pengeluaran id=${id} tidak ditemukan`);
+  return toExpenseRow(row as unknown as ExpenseWithCreator);
 }
 
 export interface ExpenseInput {
@@ -79,66 +135,79 @@ export interface ExpenseInput {
 
 /** Pengeluaran operasional (gaji, listrik, internet, dst). Input = baca = OWNER (amandemen RBAC FE-11). */
 export async function createExpense(input: ExpenseInput, createdBy: number | null): Promise<ExpenseRow> {
-  return withTx(async (client) => {
-    const res = await client.query<{ id: number }>(
-      `INSERT INTO operational_expenses (expense_date, category, description, amount, created_by, is_test)
-       VALUES (COALESCE($1::date, CURRENT_DATE), UPPER($2), $3, $4, $5, COALESCE($6, false)) RETURNING id`,
-      [
-        input.expense_date ?? null,
-        input.category.trim(),
-        input.description ?? null,
-        input.amount,
-        createdBy,
-        input.is_test ?? null,
-      ],
-    );
-    return getExpense(res.rows[0]!.id, client);
-  }, 'expense-create');
+  try {
+    return await withOrmTx(async (transaction) => {
+      // `expense_date` tidak diisi -> DEFAULT `CURRENT_DATE` dievaluasi PostgreSQL
+      // (padanan `COALESCE($1::date, CURRENT_DATE)` versi lama).
+      const created = await OperationalExpense.create(
+        {
+          ...(input.expense_date ? { expense_date: input.expense_date } : {}),
+          category: input.category.trim().toUpperCase(),
+          description: input.description ?? null,
+          amount: input.amount,
+          created_by: createdBy,
+          is_test: input.is_test ?? false,
+        },
+        { transaction },
+      );
+      return getExpense(created.id, transaction);
+    }, 'expense-create');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
 
-/** Owner boleh mengoreksi (input dan update). Kategori dinormalisasi UPPERCASE. */
+/**
+ * `PATCH /expenses/:id` — owner boleh mengoreksi opex yang diinput manual
+ * (kategori dinormalisasi UPPERCASE, hanya field yang dikirim yang berubah).
+ *
+ * IMMUTABLE untuk opex turunan sistem (`source = 'SUPPLIER_RETURN'`, yaitu opex
+ * write-off dari settle retur distributor): angka rugi pada pembukuan harus
+ * selalu mengikuti dokumen returnnya, jadi tidak boleh diedit dari layar opex
+ * (405 `IMMUTABLE_RECORD`) — memo yang sama seperti trigger
+ * `trg_stock_movement_immutable` untuk ledger stok.
+ */
 export async function updateExpense(id: number, input: Partial<ExpenseInput>): Promise<ExpenseRow> {
-  return withTx(async (client) => {
-    const cur = await client.query<{ id: number }>(
-      'SELECT id FROM operational_expenses WHERE id = $1 FOR UPDATE',
-      [id],
-    );
-    if (!cur.rows[0]) throw new ApiError('EXPENSE_NOT_FOUND', `Pengeluaran id=${id} tidak ditemukan`);
+  try {
+    return await withOrmTx(async (transaction) => {
+      const row = await OperationalExpense.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+      if (!row) throw new ApiError('EXPENSE_NOT_FOUND', `Pengeluaran id=${id} tidak ditemukan`);
+      if (row.source !== 'MANUAL') {
+        throw new ApiError(
+          'IMMUTABLE_RECORD',
+          `Pengeluaran id=${id} berasal dari sistem (${row.source}) sehingga tidak bisa dikoreksi manual`,
+        );
+      }
 
-    const sets: string[] = [];
-    const args: unknown[] = [];
-    if (input.expense_date !== undefined) {
-      args.push(input.expense_date);
-      sets.push(`expense_date = $${args.length}::date`);
-    }
-    if (input.category !== undefined) {
-      args.push(input.category.trim().toUpperCase());
-      sets.push(`category = $${args.length}`);
-    }
-    if (input.description !== undefined) {
-      args.push(input.description);
-      sets.push(`description = $${args.length}`);
-    }
-    if (input.amount !== undefined) {
-      args.push(input.amount);
-      sets.push(`amount = $${args.length}`);
-    }
-    if (input.is_test !== undefined) {
-      args.push(input.is_test);
-      sets.push(`is_test = $${args.length}`);
-    }
-    if (sets.length === 0) return getExpense(id, client);
+      const sets: Record<string, unknown> = {};
+      if (input.expense_date !== undefined) sets.expense_date = input.expense_date;
+      if (input.category !== undefined) sets.category = input.category.trim().toUpperCase();
+      if (input.description !== undefined) sets.description = input.description;
+      if (input.amount !== undefined) sets.amount = input.amount;
+      if (input.is_test !== undefined) sets.is_test = input.is_test;
 
-    args.push(new Date());
-    sets.push(`updated_at = $${args.length}`);
-    args.push(id);
-    await client.query(`UPDATE operational_expenses SET ${sets.join(', ')} WHERE id = $${args.length}`, args);
-    return getExpense(id, client);
-  }, 'expense-update');
+      // Tidak ada field yang dikirim -> tidak ada UPDATE (parity versi lama).
+      if (Object.keys(sets).length > 0) {
+        await row.update({ ...sets, updated_at: new Date() }, { transaction });
+      }
+      return getExpense(id, transaction);
+    }, 'expense-update');
+  } catch (err) {
+    throw mapOrmError(err);
+  }
 }
+
+/* ====================== opex otomatis write-off retur distributor ====================== */
 
 /** Kategori opex otomatis ketika distributor menolak barang rusak yang diretur. */
 export const WRITEOFF_CATEGORY = 'BARANG_RUSAK';
+
+/** Tanggal hari ini di zona waktu bisnis (bukan `CURRENT_DATE` server yang UTC). */
+function businessToday(): string {
+  // `en-CA` -> bentuk YYYY-MM-DD. Dipakai untuk opex write-off supaya tanggalnya
+  // sama dengan `(now() AT TIME ZONE $tz)::date` versi raw SQL lama.
+  return new Intl.DateTimeFormat('en-CA', { timeZone: env.businessTz }).format(new Date());
+}
 
 /**
  * Catat opex write-off barang rusak yang ditolak distributor (UC-B, settle WRITTEN_OFF).
@@ -148,7 +217,7 @@ export const WRITEOFF_CATEGORY = 'BARANG_RUSAK';
  * `is_test` diteruskan dari context pemanggil (opsional) supaya retur uji tidak masuk P&L.
  */
 export async function recordWriteOffExpense(
-  client: PoolClient,
+  transaction: Transaction,
   input: {
     supplier_return_id: number;
     return_no: string;
@@ -169,34 +238,35 @@ export async function recordWriteOffExpense(
     .filter(Boolean)
     .join(' - ');
 
-  const res = await client.query<{ id: number }>(
-    `INSERT INTO operational_expenses
-       (expense_date, category, description, amount, created_by, source, supplier_return_id, is_test)
-     VALUES ((now() AT TIME ZONE $1)::date, $2, $3, $4, $5, 'SUPPLIER_RETURN', $6, COALESCE($7, false))
-     RETURNING id`,
-    [
-      env.businessTz,
-      WRITEOFF_CATEGORY,
-      description.slice(0, 500),
-      input.amount,
-      input.created_by,
-      input.supplier_return_id,
-      input.is_test ?? null,
-    ],
+  const created = await OperationalExpense.create(
+    {
+      expense_date: businessToday(),
+      category: WRITEOFF_CATEGORY,
+      description: description.slice(0, 500),
+      amount: input.amount,
+      created_by: input.created_by,
+      source: 'SUPPLIER_RETURN',
+      supplier_return_id: input.supplier_return_id,
+      is_test: input.is_test ?? false,
+    },
+    { transaction },
   );
 
-  return getExpense(res.rows[0]!.id, client);
+  return getExpense(created.id, transaction);
 }
 
 /** Opex otomatis yang menempel pada satu retur distributor (dipakai detail retur). */
 export async function getWriteOffExpense(
-  client: PoolClient | null,
+  transaction: Transaction | null | undefined,
   supplierReturnId: number,
 ): Promise<ExpenseRow | null> {
-  const runner = client ? client.query.bind(client) : pool.query.bind(pool);
-  const res = await runner<ExpenseRow>(
-    `${SELECT_EXPENSE} WHERE e.supplier_return_id = $1 ORDER BY e.id ASC LIMIT 1`,
-    [supplierReturnId],
-  );
-  return res.rows[0] ?? null;
+  const row = await OperationalExpense.findOne({
+    where: { supplier_return_id: supplierReturnId },
+    include: EXPENSE_INCLUDES,
+    // `LIMIT 1` versi lama dipertahankan (FK membuat barisnya maksimal satu,
+    // tapi urutan id dipakai sebagai penentu kalau ada data lama).
+    order: [['id', 'ASC']],
+    transaction,
+  });
+  return row ? toExpenseRow(row as unknown as ExpenseWithCreator) : null;
 }
